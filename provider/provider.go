@@ -188,10 +188,11 @@ func payloadFromEvent(event *pluginv1.WatchSyncEvent) (scrobblePayload, bool, *p
 		payload.Action = "pause"
 	case pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP:
 		payload.Action = "stop"
-		completed = event.GetWatchHistoryId() != "" || event.GetCompletionPercent() >= 100
-		if completed {
-			payload.Completed = boolPointer(true)
-		}
+		completed = event.GetCompleted()
+		// Floppy falls back to a duration-buffer heuristic when completed is
+		// omitted. Always send Silo's authoritative completion state so an
+		// incomplete stop near the end of a short title stays incomplete.
+		payload.Completed = boolPointer(completed)
 	default:
 		return scrobblePayload{}, false, invalidRequestFault("Floppy does not support this watch operation")
 	}

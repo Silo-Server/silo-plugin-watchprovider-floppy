@@ -154,6 +154,59 @@ func TestApplyWatchedIsIdempotentAcrossAtLeastOnceDelivery(t *testing.T) {
 	}
 }
 
+func TestIncompleteScrobbleStopOverridesFloppyCompletionHeuristic(t *testing.T) {
+	t.Parallel()
+	event := &pluginv1.WatchSyncEvent{
+		EventId:           "playback-1",
+		Operation:         pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP,
+		PositionSeconds:   88,
+		DurationSeconds:   303,
+		CompletionPercent: 29,
+		Media: &pluginv1.WatchSyncMedia{
+			MediaType:   pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE,
+			ExternalIds: map[string]string{"tmdb": "13929"},
+		},
+	}
+
+	payload, completed, fault := payloadFromEvent(event)
+	if fault != nil {
+		t.Fatalf("fault = %#v", fault)
+	}
+	if completed {
+		t.Fatal("completed = true, want false")
+	}
+	if payload.Completed == nil || *payload.Completed {
+		t.Fatalf("payload completed = %v, want explicit false", payload.Completed)
+	}
+}
+
+func TestCompletedScrobbleStopUsesAuthoritativeHostState(t *testing.T) {
+	t.Parallel()
+	event := &pluginv1.WatchSyncEvent{
+		EventId:           "playback-2",
+		Operation:         pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP,
+		PositionSeconds:   270,
+		DurationSeconds:   300,
+		CompletionPercent: 90,
+		Completed:         true,
+		Media: &pluginv1.WatchSyncMedia{
+			MediaType:   pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_MOVIE,
+			ExternalIds: map[string]string{"tmdb": "13929"},
+		},
+	}
+
+	payload, completed, fault := payloadFromEvent(event)
+	if fault != nil {
+		t.Fatalf("fault = %#v", fault)
+	}
+	if !completed {
+		t.Fatal("completed = false, want true")
+	}
+	if payload.Completed == nil || !*payload.Completed {
+		t.Fatalf("payload completed = %v, want explicit true", payload.Completed)
+	}
+}
+
 func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T) {
 	t.Parallel()
 	playedAt := time.Date(2026, time.August, 5, 14, 0, 0, 0, time.UTC)
