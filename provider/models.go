@@ -29,6 +29,7 @@ type historyEntry struct {
 	Item         historyItem     `json:"item"`
 	Title        string          `json:"title"`
 	DisplayTitle string          `json:"display_title"`
+	Status       string          `json:"status"`
 	PlayedAt     string          `json:"played_at_local"`
 	PlayCount    int             `json:"play_count"`
 	InstanceID   json.RawMessage `json:"instance_id"`

@@ -43,6 +43,9 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 	}
 	for _, day := range upstream.Results {
 		for _, entry := range day.Entries {
+			if !completedHistoryEntry(entry) {
+				continue
+			}
 			watchedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt)
 			if err != nil || !watchedAt.After(cursor) || watchedAt.After(token.HighWater) {
 				continue
@@ -234,6 +237,9 @@ func historyContainsEvent(ctx context.Context, client *apiClient, event *pluginv
 	}
 	for _, day := range upstream.Results {
 		for _, entry := range day.Entries {
+			if !completedHistoryEntry(entry) {
+				continue
+			}
 			playedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt)
 			if err != nil || absoluteDuration(playedAt.Sub(occurredAt)) > 2*time.Second {
 				continue
@@ -244,6 +250,10 @@ func historyContainsEvent(ctx context.Context, client *apiClient, event *pluginv
 		}
 	}
 	return false, nil
+}
+
+func completedHistoryEntry(entry historyEntry) bool {
+	return strings.EqualFold(strings.TrimSpace(entry.Status), "completed")
 }
 
 func mediaMatchesHistory(media *pluginv1.WatchSyncMedia, entry historyEntry) bool {

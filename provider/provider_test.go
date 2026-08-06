@@ -258,13 +258,30 @@ func historyDayPayload(playedAt time.Time) map[string]any {
 		"date": playedAt.Format(time.DateOnly),
 		"entries": []any{map[string]any{
 			"media_type": "episode", "title": "The One", "display_title": "The One",
-			"played_at_local": playedAt.Format(time.RFC3339Nano), "play_count": 1, "instance_id": 42,
+			"status": "Completed", "played_at_local": playedAt.Format(time.RFC3339Nano), "play_count": 1, "instance_id": 42,
 			"item": map[string]any{
 				"media_type": "episode", "media_id": "1668", "source": "tmdb", "title": "Friends",
 				"season_number": 1, "episode_number": 2,
 				"provider_external_ids": map[string]any{"tmdb_id": "1668", "tvdb_id": "79168"},
 			},
 		}},
+	}
+}
+
+func TestCompletedHistoryEntry(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		status string
+		want   bool
+	}{
+		{status: "Completed", want: true},
+		{status: " completed ", want: true},
+		{status: "In progress", want: false},
+		{status: "", want: false},
+	} {
+		if got := completedHistoryEntry(historyEntry{Status: test.status}); got != test.want {
+			t.Errorf("completedHistoryEntry(%q) = %t, want %t", test.status, got, test.want)
+		}
 	}
 }
 
