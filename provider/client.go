@@ -17,7 +17,13 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
-const maxResponseBytes = 8 << 20
+const (
+	maxResponseBytes = 8 << 20
+	// A cold Floppy metadata lookup can legitimately take more than a minute.
+	// Stay below the host's two-minute watch-sync RPC deadline so transport
+	// failures are still reported as provider faults with room for cleanup.
+	defaultRequestTimeout = 110 * time.Second
+)
 
 type apiClient struct {
 	baseURL *url.URL
@@ -35,7 +41,7 @@ func newAPIClient(rawBaseURL, token string, httpClient *http.Client) (*apiClient
 	}
 	baseURL.Path = strings.TrimRight(baseURL.Path, "/")
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 20 * time.Second}
+		httpClient = &http.Client{Timeout: defaultRequestTimeout}
 	}
 	return &apiClient{baseURL: baseURL, token: strings.TrimSpace(token), http: httpClient}, nil
 }
