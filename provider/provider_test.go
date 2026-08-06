@@ -47,6 +47,9 @@ func TestExchangeAPIKeyValidatesAndReturnsHostOwnedCredentials(t *testing.T) {
 	if response.GetCredentials().GetAccessToken() != "secret-token" || response.GetCredentials().GetTokenType() != "Bearer" {
 		t.Fatalf("credentials = %#v", response.GetCredentials())
 	}
+	if response.GetCredentials().GetSecretAttributes()[configBaseURL] != upstream.URL {
+		t.Fatalf("connection base URL = %q", response.GetCredentials().GetSecretAttributes()[configBaseURL])
+	}
 	if response.GetAccount().GetExternalSubject() != "quick" {
 		t.Fatalf("account = %#v", response.GetAccount())
 	}
@@ -371,7 +374,28 @@ func authenticatedContext(baseURL string) *pluginv1.WatchSyncAuthenticatedContex
 	return &pluginv1.WatchSyncAuthenticatedContext{
 		CapabilityId:   capabilityID,
 		ProviderConfig: providerConfig(baseURL),
-		Credentials:    credentials("token"),
+		Credentials:    credentials("token", baseURL),
+	}
+}
+
+func TestAuthenticatedClientPrefersConnectionURLAndSupportsLegacyFallback(t *testing.T) {
+	t.Parallel()
+	server := NewServer(nil)
+	connectionClient, fault := server.authenticatedClient(&pluginv1.WatchSyncAuthenticatedContext{
+		CapabilityId:   capabilityID,
+		ProviderConfig: providerConfig("https://legacy.example.com"),
+		Credentials:    credentials("token", "https://personal.example.com"),
+	})
+	if fault != nil || connectionClient.baseURL.String() != "https://personal.example.com" {
+		t.Fatalf("connection client = %#v, fault = %#v", connectionClient, fault)
+	}
+	legacyClient, fault := server.authenticatedClient(&pluginv1.WatchSyncAuthenticatedContext{
+		CapabilityId:   capabilityID,
+		ProviderConfig: providerConfig("https://legacy.example.com"),
+		Credentials:    &pluginv1.WatchSyncCredentials{AccessToken: "token"},
+	})
+	if fault != nil || legacyClient.baseURL.String() != "https://legacy.example.com" {
+		t.Fatalf("legacy client = %#v, fault = %#v", legacyClient, fault)
 	}
 }
 
