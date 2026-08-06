@@ -133,6 +133,9 @@ func (s *Server) applyEvent(ctx context.Context, client *apiClient, event *plugi
 			}, nil
 		}
 	}
+	// Floppy's scrobble endpoint is convergent: start and pause replace the live
+	// playback state, while incomplete stops upsert durable progress. Completed
+	// stops additionally use the history lookup above for at-least-once delivery.
 	requestFault := client.do(ctx, http.MethodPost, "/api/v1/scrobble/", nil, payload, nil, "Bearer")
 	if requestFault != nil {
 		if connectionWide(requestFault) {
@@ -359,14 +362,23 @@ func cloneMap(input map[string]string) map[string]string {
 
 func rawString(value json.RawMessage) string {
 	trimmed := strings.TrimSpace(string(value))
-	if unquoted, err := strconv.Unquote(trimmed); err == nil {
-		return unquoted
+	if trimmed == "" || trimmed == "null" {
+		return ""
 	}
-	return trimmed
+	var decoded string
+	if err := json.Unmarshal(value, &decoded); err == nil {
+		return decoded
+	}
+	if json.Valid(value) && !strings.HasPrefix(trimmed, `"`) {
+		return trimmed
+	}
+	return ""
 }
 
 func stringValue(value any) string {
 	switch typed := value.(type) {
+	case nil:
+		return ""
 	case string:
 		return typed
 	case float64:
@@ -385,7 +397,7 @@ func normalizedIDs(input map[string]any) map[string]string {
 		if key != "tmdb" && key != "imdb" && key != "tvdb" {
 			continue
 		}
-		if id := strings.TrimSpace(stringValue(value)); id != "" && id != "<nil>" {
+		if id := strings.TrimSpace(stringValue(value)); id != "" {
 			output[key] = id
 		}
 	}
@@ -393,19 +405,36 @@ func normalizedIDs(input map[string]any) map[string]string {
 }
 
 func mergedExternalIDs(media *pluginv1.WatchSyncMedia) map[string]string {
-	output := cloneMap(media.GetExternalIds())
+	seriesIDs := filteredExternalIDs(media.GetSeriesExternalIds())
+	if media.GetMediaType() == pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE && len(seriesIDs) > 0 {
+		// Floppy identifies episode history and scrobbles by the series IDs plus
+		// season/episode numbers. Episode-level IDs share the same namespaces but
+		// are not interchangeable with series IDs.
+		return seriesIDs
+	}
+	output := filteredExternalIDs(media.GetExternalIds())
 	if output == nil {
 		output = make(map[string]string)
 	}
-	for key, value := range media.GetSeriesExternalIds() {
+	for key, value := range seriesIDs {
 		if output[key] == "" {
 			output[key] = value
 		}
 	}
-	for key := range output {
-		if key != "tmdb" && key != "imdb" && key != "tvdb" || strings.TrimSpace(output[key]) == "" {
-			delete(output, key)
+	return output
+}
+
+func filteredExternalIDs(input map[string]string) map[string]string {
+	output := make(map[string]string)
+	for key, value := range input {
+		key = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(key)), "_id")
+		value = strings.TrimSpace(value)
+		if (key == "tmdb" || key == "imdb" || key == "tvdb") && value != "" {
+			output[key] = value
 		}
+	}
+	if len(output) == 0 {
+		return nil
 	}
 	return output
 }

@@ -18,9 +18,12 @@ import (
 func TestExchangeAPIKeyValidatesAndReturnsHostOwnedCredentials(t *testing.T) {
 	t.Parallel()
 	var authorization string
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/apis/listenbrainz/1/validate-token" {
-			t.Fatalf("path = %q", r.URL.Path)
+			t.Errorf("path = %q", r.URL.Path)
+			http.Error(w, "unexpected path", http.StatusNotFound)
+			return
 		}
 		authorization = r.Header.Get("Authorization")
 		writeJSON(t, w, map[string]any{"valid": true, "user_name": "quick"})
@@ -55,9 +58,12 @@ func TestApplyWatchedIsIdempotentAcrossAtLeastOnceDelivery(t *testing.T) {
 	var mu sync.Mutex
 	watched := false
 	scrobbleCalls := 0
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer token" {
-			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+			t.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/history/":
@@ -66,21 +72,38 @@ func TestApplyWatchedIsIdempotentAcrossAtLeastOnceDelivery(t *testing.T) {
 			mu.Unlock()
 			results := []any{}
 			if isWatched {
-				results = append(results, historyDayPayload(occurredAt))
+				if r.URL.Query().Get("offset") == "50" {
+					results = append(results, historyDayPayload(occurredAt))
+				} else {
+					results = append(results, historyDayPayload(occurredAt.Add(-time.Minute)))
+				}
+			}
+			next := any(nil)
+			total := len(results)
+			offset := 0
+			if isWatched && r.URL.Query().Get("offset") != "50" {
+				next = upstream.URL + "/api/v1/history/?offset=50"
+				total = 51
+			} else if r.URL.Query().Get("offset") == "50" {
+				offset = 50
 			}
 			writeJSON(t, w, map[string]any{
-				"pagination": map[string]any{"total": len(results), "limit": 10, "offset": 0, "next": nil},
+				"pagination": map[string]any{"total": total, "limit": 50, "offset": offset, "next": next},
 				"results":    results,
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/scrobble/":
 			var payload scrobblePayload
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-				t.Fatal(err)
+				t.Errorf("decode payload: %v", err)
+				http.Error(w, "invalid payload", http.StatusBadRequest)
+				return
 			}
 			if payload.Action != "stop" || payload.MediaType != "episode" || payload.IDs["tmdb"] != "1668" ||
 				payload.SeasonNumber == nil || *payload.SeasonNumber != 1 || payload.EpisodeNumber == nil || *payload.EpisodeNumber != 2 ||
 				payload.Completed == nil || !*payload.Completed || payload.PlayedAt != occurredAt.Format(time.RFC3339Nano) {
-				t.Fatalf("payload = %#v", payload)
+				t.Errorf("payload = %#v", payload)
+				http.Error(w, "unexpected payload", http.StatusBadRequest)
+				return
 			}
 			mu.Lock()
 			watched = true
@@ -99,6 +122,7 @@ func TestApplyWatchedIsIdempotentAcrossAtLeastOnceDelivery(t *testing.T) {
 		OccurredAt: timestamppb.New(occurredAt),
 		Media: &pluginv1.WatchSyncMedia{
 			MediaType:         pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE,
+			ExternalIds:       map[string]string{"tmdb": "episode-9999"},
 			SeriesExternalIds: map[string]string{"tmdb": "1668"},
 			SeasonNumber:      1,
 			EpisodeNumber:     2,
@@ -119,8 +143,11 @@ func TestApplyWatchedIsIdempotentAcrossAtLeastOnceDelivery(t *testing.T) {
 			t.Fatalf("attempt %d response = %#v", index+1, response)
 		}
 	}
-	if scrobbleCalls != 1 {
-		t.Fatalf("scrobble calls = %d, want 1", scrobbleCalls)
+	mu.Lock()
+	gotScrobbleCalls := scrobbleCalls
+	mu.Unlock()
+	if gotScrobbleCalls != 1 {
+		t.Fatalf("scrobble calls = %d, want 1", gotScrobbleCalls)
 	}
 }
 
@@ -128,9 +155,12 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 	t.Parallel()
 	highWater := time.Date(2026, time.August, 5, 15, 0, 0, 0, time.UTC)
 	playedAt := highWater.Add(-time.Hour)
+	var mu sync.Mutex
 	var queries []url.Values
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		queries = append(queries, r.URL.Query())
+		mu.Unlock()
 		offset := r.URL.Query().Get("offset")
 		if offset == "0" {
 			writeJSON(t, w, map[string]any{
@@ -172,8 +202,11 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 	if second.GetNextPageToken() != "" || second.GetNextCursor() != highWater.Format(time.RFC3339Nano) || !second.GetCompleteSnapshot() {
 		t.Fatalf("second = %#v", second)
 	}
-	if len(queries) != 2 || queries[0].Get("end_date") != "2026-08-06" || queries[1].Get("offset") != "1" {
-		t.Fatalf("queries = %#v", queries)
+	mu.Lock()
+	gotQueries := append([]url.Values(nil), queries...)
+	mu.Unlock()
+	if len(gotQueries) != 2 || gotQueries[0].Get("end_date") != "2026-08-06" || gotQueries[1].Get("offset") != "1" {
+		t.Fatalf("queries = %#v", gotQueries)
 	}
 }
 
@@ -183,7 +216,9 @@ func TestListProgressMapsResumeState(t *testing.T) {
 	updatedAt := highWater.Add(-time.Minute)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/playback/progress/" || r.URL.Query().Get("completed") != "false" {
-			t.Fatalf("request = %s?%s", r.URL.Path, r.URL.RawQuery)
+			t.Errorf("request = %s?%s", r.URL.Path, r.URL.RawQuery)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
 		}
 		writeJSON(t, w, map[string]any{
 			"pagination": map[string]any{"total": 1, "limit": 50, "offset": 0, "next": nil},
@@ -289,7 +324,7 @@ func writeJSON(t *testing.T, w http.ResponseWriter, value any) {
 	t.Helper()
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(value); err != nil {
-		t.Fatal(err)
+		t.Errorf("encode response: %v", err)
 	}
 }
 
@@ -298,5 +333,15 @@ func TestBaseURLRejectsEmbeddedCredentials(t *testing.T) {
 	_, err := newAPIClient("https://user:pass@example.com", "token", nil)
 	if err == nil || !strings.Contains(err.Error(), "credentials") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRawStringDecodesEscapesAndNull(t *testing.T) {
+	t.Parallel()
+	if got := rawString(json.RawMessage(`"show\/name\u0031"`)); got != "show/name1" {
+		t.Fatalf("rawString escaped value = %q", got)
+	}
+	if got := rawString(json.RawMessage(`null`)); got != "" {
+		t.Fatalf("rawString null = %q", got)
 	}
 }

@@ -112,8 +112,9 @@ func watchedState(entry historyEntry, watchedAt time.Time) *pluginv1.WatchSyncRe
 	if media == nil {
 		return nil
 	}
-	providerKey := "history:" + entry.MediaType + ":" + rawString(entry.InstanceID)
-	if strings.HasSuffix(providerKey, ":") {
+	instanceID := rawString(entry.InstanceID)
+	providerKey := "history:" + entry.MediaType + ":" + instanceID
+	if instanceID == "" {
 		providerKey = fmt.Sprintf("history:%s:%d", entry.MediaType, watchedAt.UnixNano())
 	}
 	playCount := int32(max(1, entry.PlayCount))
@@ -229,27 +230,59 @@ func historyContainsEvent(ctx context.Context, client *apiClient, event *pluginv
 		"start_date":    {occurredAt.Add(-24 * time.Hour).Format(time.DateOnly)},
 		"end_date":      {occurredAt.Add(24 * time.Hour).Format(time.DateOnly)},
 		"logging_style": {"sessions"},
-		"limit":         {"10"},
+		"limit":         {strconv.Itoa(defaultPageSize)},
 	}
-	var upstream historyResponse
-	if fault := client.do(ctx, http.MethodGet, "/api/v1/history/", query, nil, &upstream, "Bearer"); fault != nil {
-		return false, fault
-	}
-	for _, day := range upstream.Results {
-		for _, entry := range day.Entries {
-			if !completedHistoryEntry(entry) {
-				continue
-			}
-			playedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt)
-			if err != nil || absoluteDuration(playedAt.Sub(occurredAt)) > 2*time.Second {
-				continue
-			}
-			if mediaMatchesHistory(event.GetMedia(), entry) {
-				return true, nil
+	for offset := 0; ; {
+		query.Set("offset", strconv.Itoa(offset))
+		var upstream historyResponse
+		if fault := client.do(ctx, http.MethodGet, "/api/v1/history/", query, nil, &upstream, "Bearer"); fault != nil {
+			return false, fault
+		}
+		for _, day := range upstream.Results {
+			for _, entry := range day.Entries {
+				if !completedHistoryEntry(entry) {
+					continue
+				}
+				playedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt)
+				if err != nil || absoluteDuration(playedAt.Sub(occurredAt)) > 2*time.Second {
+					continue
+				}
+				if mediaMatchesHistory(event.GetMedia(), entry) {
+					return true, nil
+				}
 			}
 		}
+		nextOffset, more, paginationFault := nextOffsetFromHistory(upstream.Pagination, offset)
+		if paginationFault != nil {
+			return false, paginationFault
+		}
+		if !more {
+			return false, nil
+		}
+		offset = nextOffset
 	}
-	return false, nil
+}
+
+func nextOffsetFromHistory(page pagination, current int) (int, bool, *pluginv1.WatchSyncFault) {
+	if page.Next == "" && (page.Total <= 0 || current+max(1, page.Limit) >= page.Total) {
+		return 0, false, nil
+	}
+	next := current + max(1, page.Limit)
+	if page.Next != "" {
+		parsed, err := url.Parse(page.Next)
+		if err != nil {
+			return 0, false, temporaryFault("Floppy returned invalid history pagination", 0)
+		}
+		candidate, candidateErr := strconv.Atoi(parsed.Query().Get("offset"))
+		if candidateErr != nil || candidate <= current {
+			return 0, false, temporaryFault("Floppy returned invalid history pagination", 0)
+		}
+		next = candidate
+	}
+	if next <= current {
+		return 0, false, temporaryFault("Floppy returned invalid history pagination", 0)
+	}
+	return next, true, nil
 }
 
 func completedHistoryEntry(entry historyEntry) bool {
