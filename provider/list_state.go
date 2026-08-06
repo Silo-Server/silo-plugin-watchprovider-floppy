@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -12,12 +13,14 @@ import (
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 )
 
+const providerCursorOverlap = 2 * time.Second
+
 func (s *Server) listWatched(ctx context.Context, client *apiClient, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {
 	cursor, fault := parseCursor(req.GetCursor())
 	if fault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: fault}, nil
 	}
-	token, fault := traversal(req, s.now())
+	token, fault := traversal(req)
 	if fault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: fault}, nil
 	}
@@ -32,7 +35,9 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 		// Widen by a day and apply the exact timestamp bounds locally.
 		query.Set("start_date", cursor.Add(-24*time.Hour).Format(time.DateOnly))
 	}
-	query.Set("end_date", token.HighWater.Add(24*time.Hour).Format(time.DateOnly))
+	if !token.HighWater.IsZero() {
+		query.Set("end_date", token.HighWater.Add(24*time.Hour).Format(time.DateOnly))
+	}
 
 	var upstream historyResponse
 	if requestFault := client.do(ctx, http.MethodGet, "/api/v1/history/", query, nil, &upstream, "Bearer"); requestFault != nil {
@@ -41,13 +46,16 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 	response := &pluginv1.WatchSyncListRemoteStateResponse{
 		CompleteSnapshot: cursor.IsZero(),
 	}
+	if token.HighWater.IsZero() {
+		token.HighWater = historyWatermark(upstream.Results)
+	}
 	for _, day := range upstream.Results {
 		for _, entry := range day.Entries {
 			if !completedHistoryEntry(entry) {
 				continue
 			}
 			watchedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt)
-			if err != nil || !watchedAt.After(cursor) || watchedAt.After(token.HighWater) {
+			if err != nil || !watchedAt.After(cursor) || (!token.HighWater.IsZero() && watchedAt.After(token.HighWater)) {
 				continue
 			}
 			state := watchedState(entry, watchedAt)
@@ -56,10 +64,18 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 			}
 		}
 	}
-	if upstream.Pagination.Next != "" || token.Offset+limit < upstream.Pagination.Total {
-		response.NextPageToken = nextPageToken(token.Offset+limit, token.HighWater)
-	} else {
-		response.NextCursor = token.HighWater.UTC().Format(time.RFC3339Nano)
+	nextOffset, more, paginationFault := nextOffsetFromPagination(upstream.Pagination, token.Offset)
+	if paginationFault != nil {
+		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: paginationFault}, nil
+	}
+	if more {
+		if token.HighWater.IsZero() {
+			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: temporaryFault("Floppy returned history pages without a usable timestamp", 0)}, nil
+		}
+		token.Offset = nextOffset
+		response.NextPageToken = nextPageToken(token)
+	} else if nextCursor := providerNextCursor(cursor, token.HighWater); nextCursor != "" {
+		response.NextCursor = nextCursor
 	}
 	return response, nil
 }
@@ -69,42 +85,129 @@ func (s *Server) listProgress(ctx context.Context, client *apiClient, req *plugi
 	if fault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: fault}, nil
 	}
-	token, fault := traversal(req, s.now())
+	token, fault := traversal(req)
 	if fault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: fault}, nil
 	}
+	entries, requestFault := fetchProgressSnapshot(ctx, client, cursor)
+	if requestFault != nil {
+		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: requestFault}, nil
+	}
+	response := &pluginv1.WatchSyncListRemoteStateResponse{CompleteSnapshot: cursor.IsZero()}
+	candidates := make([]progressCandidate, 0, len(entries))
+	for _, entry := range entries {
+		updatedAt, err := time.Parse(time.RFC3339Nano, entry.UpdatedAt)
+		if err != nil || !updatedAt.After(cursor) {
+			continue
+		}
+		state := progressState(entry, updatedAt)
+		if state != nil {
+			candidates = append(candidates, progressCandidate{state: state, updatedAt: updatedAt, key: state.GetProviderItemKey()})
+		}
+	}
+	if token.HighWater.IsZero() {
+		for _, candidate := range candidates {
+			if candidate.updatedAt.After(token.HighWater) {
+				token.HighWater = candidate.updatedAt
+			}
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].updatedAt.Equal(candidates[j].updatedAt) {
+			return candidates[i].key < candidates[j].key
+		}
+		return candidates[i].updatedAt.Before(candidates[j].updatedAt)
+	})
+	filtered := candidates[:0]
+	for _, candidate := range candidates {
+		if (!token.HighWater.IsZero() && candidate.updatedAt.After(token.HighWater)) || !afterProgressBoundary(candidate, token) {
+			continue
+		}
+		filtered = append(filtered, candidate)
+	}
 	limit := pageSize(req.GetPageSize())
+	page := filtered
+	if len(page) > limit {
+		page = page[:limit]
+	}
+	for _, candidate := range page {
+		response.Items = append(response.Items, candidate.state)
+	}
+	if len(filtered) > len(page) {
+		last := page[len(page)-1]
+		token.BoundaryAt = last.updatedAt
+		token.BoundaryKey = last.key
+		response.NextPageToken = nextPageToken(token)
+	} else if nextCursor := providerNextCursor(cursor, token.HighWater); nextCursor != "" {
+		response.NextCursor = nextCursor
+	}
+	return response, nil
+}
+
+type progressCandidate struct {
+	state     *pluginv1.WatchSyncRemoteState
+	updatedAt time.Time
+	key       string
+}
+
+func afterProgressBoundary(candidate progressCandidate, token traversalToken) bool {
+	if token.BoundaryAt.IsZero() {
+		return true
+	}
+	return candidate.updatedAt.After(token.BoundaryAt) ||
+		(candidate.updatedAt.Equal(token.BoundaryAt) && candidate.key > token.BoundaryKey)
+}
+
+func fetchProgressSnapshot(ctx context.Context, client *apiClient, cursor time.Time) ([]progressEntry, *pluginv1.WatchSyncFault) {
 	query := url.Values{
-		"limit":      {strconv.Itoa(limit)},
-		"offset":     {strconv.Itoa(token.Offset)},
+		"limit":      {"200"},
+		"offset":     {"0"},
 		"media_type": {"movie,episode"},
 		"completed":  {"false"},
 	}
 	if !cursor.IsZero() {
 		query.Set("updated_since", cursor.Format(time.RFC3339Nano))
 	}
+	var entries []progressEntry
+	for offset := 0; ; {
+		query.Set("offset", strconv.Itoa(offset))
+		var upstream progressResponse
+		if fault := client.do(ctx, http.MethodGet, "/api/v1/playback/progress/", query, nil, &upstream, "Bearer"); fault != nil {
+			return nil, fault
+		}
+		entries = append(entries, upstream.Results...)
+		nextOffset, more, fault := nextOffsetFromPagination(upstream.Pagination, offset)
+		if fault != nil {
+			return nil, fault
+		}
+		if !more {
+			return entries, nil
+		}
+		offset = nextOffset
+	}
+}
 
-	var upstream progressResponse
-	if requestFault := client.do(ctx, http.MethodGet, "/api/v1/playback/progress/", query, nil, &upstream, "Bearer"); requestFault != nil {
-		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: requestFault}, nil
-	}
-	response := &pluginv1.WatchSyncListRemoteStateResponse{CompleteSnapshot: cursor.IsZero()}
-	for _, entry := range upstream.Results {
-		updatedAt, err := time.Parse(time.RFC3339Nano, entry.UpdatedAt)
-		if err != nil || !updatedAt.After(cursor) || updatedAt.After(token.HighWater) {
-			continue
-		}
-		state := progressState(entry, updatedAt)
-		if state != nil {
-			response.Items = append(response.Items, state)
+func historyWatermark(days []historyDay) time.Time {
+	var watermark time.Time
+	for _, day := range days {
+		for _, entry := range day.Entries {
+			if playedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt); err == nil && playedAt.After(watermark) {
+				watermark = playedAt
+			}
 		}
 	}
-	if upstream.Pagination.Next != "" || token.Offset+limit < upstream.Pagination.Total {
-		response.NextPageToken = nextPageToken(token.Offset+limit, token.HighWater)
-	} else {
-		response.NextCursor = token.HighWater.UTC().Format(time.RFC3339Nano)
+	return watermark
+}
+
+func providerNextCursor(previous, highWater time.Time) string {
+	if highWater.IsZero() {
+		return ""
 	}
-	return response, nil
+	next := highWater.Add(-providerCursorOverlap)
+	if !previous.IsZero() && next.Before(previous) {
+		next = previous
+	}
+	return next.UTC().Format(time.RFC3339Nano)
 }
 
 func watchedState(entry historyEntry, watchedAt time.Time) *pluginv1.WatchSyncRemoteState {
@@ -115,7 +218,7 @@ func watchedState(entry historyEntry, watchedAt time.Time) *pluginv1.WatchSyncRe
 	instanceID := rawString(entry.InstanceID)
 	providerKey := "history:" + entry.MediaType + ":" + instanceID
 	if instanceID == "" {
-		providerKey = fmt.Sprintf("history:%s:%d", entry.MediaType, watchedAt.UnixNano())
+		providerKey = fmt.Sprintf("history:%s:%s:%s:%d:%d:%d", entry.MediaType, entry.Item.Source, rawString(entry.Item.MediaID), valueOrZero(entry.Item.SeasonNumber), valueOrZero(entry.Item.EpisodeNumber), watchedAt.UnixNano())
 	}
 	playCount := int32(max(1, entry.PlayCount))
 	return &pluginv1.WatchSyncRemoteState{
@@ -166,6 +269,8 @@ func mediaFromHistory(entry historyEntry) *pluginv1.WatchSyncMedia {
 		ExternalIds: cloneMap(ids),
 	}
 	if mediaType == pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE {
+		media.MediaItemId = episodeMediaItemID(entry.Item.Source, rawString(entry.Item.MediaID), valueOrZero(entry.Item.SeasonNumber), valueOrZero(entry.Item.EpisodeNumber))
+		media.ExternalIds = nil
 		media.SeriesTitle = entry.Item.Title
 		media.SeriesExternalIds = cloneMap(ids)
 		media.SeasonNumber = valueOrZero(entry.Item.SeasonNumber)
@@ -188,12 +293,18 @@ func mediaFromProgress(entry progressEntry) *pluginv1.WatchSyncMedia {
 		ExternalIds: cloneMap(ids),
 	}
 	if mediaType == pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE {
+		media.MediaItemId = episodeMediaItemID(entry.Source, rawString(entry.MediaID), valueOrZero(entry.SeasonNumber), valueOrZero(entry.EpisodeNumber))
+		media.ExternalIds = nil
 		media.SeriesTitle = entry.SeriesTitle
 		media.SeriesExternalIds = cloneMap(ids)
 		media.SeasonNumber = valueOrZero(entry.SeasonNumber)
 		media.EpisodeNumber = valueOrZero(entry.EpisodeNumber)
 	}
 	return media
+}
+
+func episodeMediaItemID(source, seriesID string, season, episode int32) string {
+	return fmt.Sprintf("%s:%s:%d:%d", source, seriesID, season, episode)
 }
 
 func addSourceID(ids map[string]string, source, mediaID string) {
@@ -252,7 +363,7 @@ func historyContainsEvent(ctx context.Context, client *apiClient, event *pluginv
 				}
 			}
 		}
-		nextOffset, more, paginationFault := nextOffsetFromHistory(upstream.Pagination, offset)
+		nextOffset, more, paginationFault := nextOffsetFromPagination(upstream.Pagination, offset)
 		if paginationFault != nil {
 			return false, paginationFault
 		}
@@ -263,24 +374,28 @@ func historyContainsEvent(ctx context.Context, client *apiClient, event *pluginv
 	}
 }
 
-func nextOffsetFromHistory(page pagination, current int) (int, bool, *pluginv1.WatchSyncFault) {
-	if page.Next == "" && (page.Total <= 0 || current+max(1, page.Limit) >= page.Total) {
+func nextOffsetFromPagination(page pagination, current int) (int, bool, *pluginv1.WatchSyncFault) {
+	step := max(1, page.Limit)
+	if page.Offset < 0 || page.Offset != current {
+		return 0, false, temporaryFault("Floppy returned invalid pagination", 0)
+	}
+	if page.Next == "" && (page.Total <= 0 || page.Offset+step >= page.Total) {
 		return 0, false, nil
 	}
-	next := current + max(1, page.Limit)
+	next := page.Offset + step
 	if page.Next != "" {
 		parsed, err := url.Parse(page.Next)
 		if err != nil {
-			return 0, false, temporaryFault("Floppy returned invalid history pagination", 0)
+			return 0, false, temporaryFault("Floppy returned invalid pagination", 0)
 		}
 		candidate, candidateErr := strconv.Atoi(parsed.Query().Get("offset"))
 		if candidateErr != nil || candidate <= current {
-			return 0, false, temporaryFault("Floppy returned invalid history pagination", 0)
+			return 0, false, temporaryFault("Floppy returned invalid pagination", 0)
 		}
 		next = candidate
 	}
 	if next <= current {
-		return 0, false, temporaryFault("Floppy returned invalid history pagination", 0)
+		return 0, false, temporaryFault("Floppy returned invalid pagination", 0)
 	}
 	return next, true, nil
 }

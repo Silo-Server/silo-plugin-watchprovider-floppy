@@ -24,11 +24,10 @@ const (
 type Server struct {
 	pluginv1.UnimplementedWatchSyncProviderServer
 	http *http.Client
-	now  func() time.Time
 }
 
 func NewServer(httpClient *http.Client) *Server {
-	return &Server{http: httpClient, now: time.Now}
+	return &Server{http: httpClient}
 }
 
 func (s *Server) ExchangeAPIKey(ctx context.Context, req *pluginv1.WatchSyncExchangeAPIKeyRequest) (*pluginv1.WatchSyncCredentialResponse, error) {
@@ -280,13 +279,15 @@ func requestedStateKind(kinds []pluginv1.WatchSyncRemoteStateKind) (pluginv1.Wat
 }
 
 type traversalToken struct {
-	Offset    int       `json:"offset"`
-	HighWater time.Time `json:"high_water"`
+	Offset      int       `json:"offset,omitempty"`
+	HighWater   time.Time `json:"high_water"`
+	BoundaryAt  time.Time `json:"boundary_at,omitempty"`
+	BoundaryKey string    `json:"boundary_key,omitempty"`
 }
 
-func traversal(req *pluginv1.WatchSyncListRemoteStateRequest, now time.Time) (traversalToken, *pluginv1.WatchSyncFault) {
+func traversal(req *pluginv1.WatchSyncListRemoteStateRequest) (traversalToken, *pluginv1.WatchSyncFault) {
 	if strings.TrimSpace(req.GetPageToken()) == "" {
-		return traversalToken{HighWater: now.UTC()}, nil
+		return traversalToken{}, nil
 	}
 	decoded, err := base64.RawURLEncoding.DecodeString(req.GetPageToken())
 	if err != nil {
@@ -299,8 +300,8 @@ func traversal(req *pluginv1.WatchSyncListRemoteStateRequest, now time.Time) (tr
 	return token, nil
 }
 
-func nextPageToken(offset int, highWater time.Time) string {
-	encoded, _ := json.Marshal(traversalToken{Offset: offset, HighWater: highWater.UTC()})
+func nextPageToken(token traversalToken) string {
+	encoded, _ := json.Marshal(token)
 	return base64.RawURLEncoding.EncodeToString(encoded)
 }
 

@@ -99,6 +99,8 @@ func faultForHTTPResponse(resp *http.Response) *pluginv1.WatchSyncFault {
 			SafeMessage: "Floppy rate limit reached",
 			RetryAfter:  durationpb.New(retryAfter(resp.Header.Get("Retry-After"))),
 		}
+	case http.StatusRequestTimeout:
+		return temporaryFault("Floppy request timed out", 0)
 	case http.StatusBadRequest, http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity:
 		return &pluginv1.WatchSyncFault{
 			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_REQUEST,

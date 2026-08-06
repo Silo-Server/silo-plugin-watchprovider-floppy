@@ -153,8 +153,7 @@ func TestApplyWatchedIsIdempotentAcrossAtLeastOnceDelivery(t *testing.T) {
 
 func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T) {
 	t.Parallel()
-	highWater := time.Date(2026, time.August, 5, 15, 0, 0, 0, time.UTC)
-	playedAt := highWater.Add(-time.Hour)
+	playedAt := time.Date(2026, time.August, 5, 14, 0, 0, 0, time.UTC)
 	var mu sync.Mutex
 	var queries []url.Values
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -164,7 +163,7 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 		offset := r.URL.Query().Get("offset")
 		if offset == "0" {
 			writeJSON(t, w, map[string]any{
-				"pagination": map[string]any{"total": 2, "limit": 1, "offset": 0, "next": "next"},
+				"pagination": map[string]any{"total": 2, "limit": 1, "offset": 0, "next": nil},
 				"results":    []any{historyDayPayload(playedAt)},
 			})
 			return
@@ -177,9 +176,8 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 	defer upstream.Close()
 
 	server := NewServer(upstream.Client())
-	server.now = func() time.Time { return highWater }
 	first, err := server.ListRemoteState(context.Background(), &pluginv1.WatchSyncListRemoteStateRequest{
-		Context: authenticatedContext(upstream.URL), PageSize: 1,
+		Context: authenticatedContext(upstream.URL), PageSize: 100,
 		StateKinds: []pluginv1.WatchSyncRemoteStateKind{pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_WATCHED},
 	})
 	if err != nil {
@@ -189,31 +187,31 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 		t.Fatalf("first = %#v", first)
 	}
 	item := first.GetItems()[0]
-	if item.GetMedia().GetSeriesExternalIds()["tmdb"] != "1668" || item.GetMedia().GetSeasonNumber() != 1 || item.GetWatched().GetPlayCount() != 1 {
+	if item.GetMedia().GetSeriesExternalIds()["tmdb"] != "1668" || len(item.GetMedia().GetExternalIds()) != 0 ||
+		item.GetMedia().GetMediaItemId() != "tmdb:1668:1:2" || item.GetMedia().GetSeasonNumber() != 1 || item.GetWatched().GetPlayCount() != 1 {
 		t.Fatalf("item = %#v", item)
 	}
 	second, err := server.ListRemoteState(context.Background(), &pluginv1.WatchSyncListRemoteStateRequest{
-		Context: authenticatedContext(upstream.URL), PageSize: 1, PageToken: first.GetNextPageToken(),
+		Context: authenticatedContext(upstream.URL), PageSize: 100, PageToken: first.GetNextPageToken(),
 		StateKinds: []pluginv1.WatchSyncRemoteStateKind{pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_WATCHED},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.GetNextPageToken() != "" || second.GetNextCursor() != highWater.Format(time.RFC3339Nano) || !second.GetCompleteSnapshot() {
+	if second.GetNextPageToken() != "" || second.GetNextCursor() != playedAt.Add(-providerCursorOverlap).Format(time.RFC3339Nano) || !second.GetCompleteSnapshot() {
 		t.Fatalf("second = %#v", second)
 	}
 	mu.Lock()
 	gotQueries := append([]url.Values(nil), queries...)
 	mu.Unlock()
-	if len(gotQueries) != 2 || gotQueries[0].Get("end_date") != "2026-08-06" || gotQueries[1].Get("offset") != "1" {
+	if len(gotQueries) != 2 || gotQueries[0].Get("end_date") != "" || gotQueries[1].Get("end_date") != "2026-08-06" || gotQueries[1].Get("offset") != "1" {
 		t.Fatalf("queries = %#v", gotQueries)
 	}
 }
 
 func TestListProgressMapsResumeState(t *testing.T) {
 	t.Parallel()
-	highWater := time.Date(2026, time.August, 5, 15, 0, 0, 0, time.UTC)
-	updatedAt := highWater.Add(-time.Minute)
+	updatedAt := time.Date(2026, time.August, 5, 14, 59, 0, 0, time.UTC)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/v1/playback/progress/" || r.URL.Query().Get("completed") != "false" {
 			t.Errorf("request = %s?%s", r.URL.Path, r.URL.RawQuery)
@@ -233,7 +231,6 @@ func TestListProgressMapsResumeState(t *testing.T) {
 	defer upstream.Close()
 
 	server := NewServer(upstream.Client())
-	server.now = func() time.Time { return highWater }
 	response, err := server.ListRemoteState(context.Background(), &pluginv1.WatchSyncListRemoteStateRequest{
 		Context:    authenticatedContext(upstream.URL),
 		StateKinds: []pluginv1.WatchSyncRemoteStateKind{pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_PROGRESS},
@@ -244,9 +241,99 @@ func TestListProgressMapsResumeState(t *testing.T) {
 	if response.GetFault() != nil || len(response.GetItems()) != 1 {
 		t.Fatalf("response = %#v", response)
 	}
+	if response.GetNextCursor() != updatedAt.Add(-providerCursorOverlap).Format(time.RFC3339Nano) {
+		t.Fatalf("next cursor = %q", response.GetNextCursor())
+	}
 	item := response.GetItems()[0]
 	if item.GetMedia().GetExternalIds()["tmdb"] != "603" || item.GetMedia().GetExternalIds()["imdb"] != "tt0133093" || item.GetProgress().GetProgressPercent() != 25 {
 		t.Fatalf("item = %#v", item)
+	}
+}
+
+func TestListProgressPageTokenSurvivesEarlierItemDeletion(t *testing.T) {
+	t.Parallel()
+	firstUpdatedAt := time.Date(2026, time.August, 5, 12, 0, 0, 0, time.UTC)
+	secondUpdatedAt := firstUpdatedAt.Add(time.Minute)
+	var mu sync.Mutex
+	entries := []any{
+		progressPayload("603", firstUpdatedAt),
+		progressPayload("604", secondUpdatedAt),
+	}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		results := append([]any(nil), entries...)
+		mu.Unlock()
+		writeJSON(t, w, map[string]any{
+			"pagination": map[string]any{"total": len(results), "limit": 200, "offset": 0, "next": nil},
+			"results":    results,
+		})
+	}))
+	defer upstream.Close()
+
+	server := NewServer(upstream.Client())
+	request := &pluginv1.WatchSyncListRemoteStateRequest{
+		Context:    authenticatedContext(upstream.URL),
+		PageSize:   1,
+		StateKinds: []pluginv1.WatchSyncRemoteStateKind{pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_PROGRESS},
+	}
+	first, err := server.ListRemoteState(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.GetFault() != nil || len(first.GetItems()) != 1 || first.GetItems()[0].GetMedia().GetExternalIds()["tmdb"] != "603" || first.GetNextPageToken() == "" {
+		t.Fatalf("first = %#v", first)
+	}
+
+	mu.Lock()
+	entries = entries[1:]
+	mu.Unlock()
+	request.PageToken = first.GetNextPageToken()
+	second, err := server.ListRemoteState(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.GetFault() != nil || len(second.GetItems()) != 1 || second.GetItems()[0].GetMedia().GetExternalIds()["tmdb"] != "604" || second.GetNextPageToken() != "" {
+		t.Fatalf("second = %#v", second)
+	}
+}
+
+func TestRequestTimeoutIsTemporary(t *testing.T) {
+	t.Parallel()
+	fault := faultForHTTPResponse(&http.Response{StatusCode: http.StatusRequestTimeout, Header: make(http.Header)})
+	if fault.GetCode() != pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_TEMPORARY {
+		t.Fatalf("fault = %#v", fault)
+	}
+}
+
+func TestProgressEpisodeKeepsSeriesIDsOutOfEpisodeIdentity(t *testing.T) {
+	t.Parallel()
+	season, episode := int32(2), int32(3)
+	updatedAt := time.Date(2026, time.August, 5, 12, 0, 0, 0, time.UTC)
+	state := progressState(progressEntry{
+		MediaType: "episode", Source: "tmdb", MediaID: json.RawMessage(`1668`),
+		SeasonNumber: &season, EpisodeNumber: &episode, IDs: map[string]any{"tmdb": "1668", "tvdb": "79168"},
+		Title: "The One", SeriesTitle: "Friends", Position: 600, Duration: 2400,
+		UpdatedAt: updatedAt.Format(time.RFC3339Nano),
+	}, updatedAt)
+	if state == nil || state.GetMedia().GetMediaItemId() != "tmdb:1668:2:3" || len(state.GetMedia().GetExternalIds()) != 0 ||
+		state.GetMedia().GetSeriesExternalIds()["tmdb"] != "1668" {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestNullHistoryInstanceIDsRemainDistinct(t *testing.T) {
+	t.Parallel()
+	watchedAt := time.Date(2026, time.August, 5, 12, 0, 0, 0, time.UTC)
+	entry := historyEntry{
+		MediaType: "movie", Status: "Completed", PlayedAt: watchedAt.Format(time.RFC3339Nano),
+		InstanceID: json.RawMessage(`null`),
+		Item:       historyItem{MediaType: "movie", Source: "tmdb", MediaID: json.RawMessage(`603`)},
+	}
+	first := watchedState(entry, watchedAt)
+	entry.Item.MediaID = json.RawMessage(`604`)
+	second := watchedState(entry, watchedAt)
+	if first == nil || second == nil || first.GetProviderItemKey() == second.GetProviderItemKey() {
+		t.Fatalf("provider keys = %q and %q", first.GetProviderItemKey(), second.GetProviderItemKey())
 	}
 }
 
@@ -300,6 +387,15 @@ func historyDayPayload(playedAt time.Time) map[string]any {
 				"provider_external_ids": map[string]any{"tmdb_id": "1668", "tvdb_id": "79168"},
 			},
 		}},
+	}
+}
+
+func progressPayload(mediaID string, updatedAt time.Time) map[string]any {
+	return map[string]any{
+		"media_type": "movie", "source": "tmdb", "media_id": mediaID,
+		"ids": map[string]any{"tmdb": mediaID}, "title": "Movie " + mediaID,
+		"position_seconds": 600, "duration_seconds": 2400, "completed": false,
+		"updated_at": updatedAt.Format(time.RFC3339Nano),
 	}
 }
 
