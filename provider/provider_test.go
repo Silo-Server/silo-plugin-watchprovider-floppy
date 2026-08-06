@@ -316,7 +316,7 @@ func TestProgressEpisodeKeepsSeriesIDsOutOfEpisodeIdentity(t *testing.T) {
 		UpdatedAt: updatedAt.Format(time.RFC3339Nano),
 	}, updatedAt)
 	if state == nil || state.GetMedia().GetMediaItemId() != "tmdb:1668:2:3" || len(state.GetMedia().GetExternalIds()) != 0 ||
-		state.GetMedia().GetSeriesExternalIds()["tmdb"] != "1668" {
+		state.GetMedia().GetSeriesExternalIds()["tmdb"] != "1668" || state.GetMedia().GetSeriesExternalIds()["tvdb"] != "79168" {
 		t.Fatalf("state = %#v", state)
 	}
 }
