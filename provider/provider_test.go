@@ -361,6 +361,17 @@ func TestRequestTimeoutIsTemporary(t *testing.T) {
 	}
 }
 
+func TestDefaultClientAllowsColdMetadataResolution(t *testing.T) {
+	t.Parallel()
+	client, err := newAPIClient("https://floppy.example.com", "token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.http.Timeout != defaultRequestTimeout {
+		t.Fatalf("timeout = %v, want %v", client.http.Timeout, defaultRequestTimeout)
+	}
+}
+
 func TestProgressEpisodeKeepsSeriesIDsOutOfEpisodeIdentity(t *testing.T) {
 	t.Parallel()
 	season, episode := int32(2), int32(3)

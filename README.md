@@ -29,7 +29,7 @@ The plugin requires a Floppy release that provides:
 
 ## Development
 
-The plugin depends on `silo-plugin-sdk` v0.13.0 or newer.
+The plugin depends on `silo-plugin-sdk` v0.13.2 or newer.
 
 ```bash
 make test
