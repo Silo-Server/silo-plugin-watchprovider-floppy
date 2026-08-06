@@ -18,8 +18,11 @@ import (
 )
 
 const (
-	maxResponseBytes      = 8 << 20
-	defaultRequestTimeout = 60 * time.Second
+	maxResponseBytes = 8 << 20
+	// A cold Floppy metadata lookup can legitimately take more than a minute.
+	// Stay below the host's two-minute watch-sync RPC deadline so transport
+	// failures are still reported as provider faults with room for cleanup.
+	defaultRequestTimeout = 110 * time.Second
 )
 
 type apiClient struct {
