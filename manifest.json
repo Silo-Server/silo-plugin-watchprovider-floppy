@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.watchprovider.floppy",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -14,6 +14,27 @@
       "id": "floppy",
       "display_name": "Floppy",
       "description": "Bidirectional watch history, resume progress, and live scrobbling for a self-hosted Floppy instance.",
+      "config_schema": [
+        {
+          "key": "floppy",
+          "title": "Your Floppy server",
+          "description": "Connection details for the Floppy server used by this profile.",
+          "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\"}},\"required\":[\"base_url\"],\"additionalProperties\":false}",
+          "required": true,
+          "admin_form": {
+            "fields": [
+              {
+                "key": "base_url",
+                "label": "Floppy server URL",
+                "description": "Root URL of your Floppy instance. API paths are added automatically.",
+                "control": "ADMIN_FORM_CONTROL_TEXT",
+                "placeholder": "https://floppy.example.com",
+                "required": true
+              }
+            ]
+          }
+        }
+      ],
       "watch_sync_provider": {
         "auth_methods": ["WATCH_SYNC_AUTH_METHOD_API_KEY"],
         "export_watched": true,
@@ -29,34 +50,12 @@
       }
     }
   ],
-  "global_config_schema": [
-    {
-      "key": "floppy",
-      "title": "Floppy instance",
-      "description": "Connection details for the self-hosted Floppy server.",
-      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\",\"format\":\"uri\"}},\"required\":[\"base_url\"],\"additionalProperties\":false}",
-      "required": true,
-      "admin_form": {
-        "submit_label": "Save Floppy instance",
-        "fields": [
-          {
-            "key": "base_url",
-            "label": "Base URL",
-            "description": "Root URL of the Floppy instance. API paths are added automatically.",
-            "control": "ADMIN_FORM_CONTROL_TEXT",
-            "placeholder": "https://floppy.example.com",
-            "required": true
-          }
-        ]
-      }
-    }
-  ],
   "category": "Watch Providers",
   "presentation": {
     "display_name": "Floppy Watch Provider",
     "summary": "Sync Silo watch activity with a self-hosted Floppy instance.",
     "description_markdown": "Imports movie and episode history and resume progress, exports completed watches, and forwards live playback start, pause, and stop events.",
-    "setup_markdown": "Configure the Floppy instance URL, then connect each Silo profile with a Floppy API token.",
+    "setup_markdown": "Connect a Silo profile by entering that profile's Floppy server URL and API token. Different profiles can use different Floppy servers.",
     "homepage_url": "https://github.com/dannyvfilms/Floppy",
     "source_url": "https://github.com/Silo-Server/silo-plugin-watchprovider-floppy",
     "support_url": "https://github.com/Silo-Server/silo-plugin-watchprovider-floppy/issues",

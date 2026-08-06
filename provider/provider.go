@@ -40,7 +40,7 @@ func (s *Server) ExchangeAPIKey(ctx context.Context, req *pluginv1.WatchSyncExch
 		return &pluginv1.WatchSyncCredentialResponse{Fault: fault}, nil
 	}
 	return &pluginv1.WatchSyncCredentialResponse{
-		Credentials: credentials(req.GetApiKey()),
+		Credentials: credentials(req.GetApiKey(), client.baseURL.String()),
 		Account:     account,
 	}, nil
 }
@@ -231,10 +231,11 @@ func (s *Server) authenticatedClient(auth *pluginv1.WatchSyncAuthenticatedContex
 	if auth == nil || auth.GetCredentials() == nil {
 		return nil, invalidRequestFault("Floppy credentials are required")
 	}
-	return s.client(auth.GetCapabilityId(), auth.GetProviderConfig(), auth.GetCredentials().GetAccessToken())
+	baseURL := auth.GetCredentials().GetSecretAttributes()[configBaseURL]
+	return s.client(auth.GetCapabilityId(), auth.GetProviderConfig(), auth.GetCredentials().GetAccessToken(), baseURL)
 }
 
-func (s *Server) client(requestedCapability string, config *pluginv1.WatchSyncProviderConfig, token string) (*apiClient, *pluginv1.WatchSyncFault) {
+func (s *Server) client(requestedCapability string, config *pluginv1.WatchSyncProviderConfig, token string, connectionBaseURL ...string) (*apiClient, *pluginv1.WatchSyncFault) {
 	if requestedCapability != capabilityID {
 		return nil, invalidRequestFault("Unknown Floppy capability")
 	}
@@ -242,8 +243,16 @@ func (s *Server) client(requestedCapability string, config *pluginv1.WatchSyncPr
 		return nil, invalidRequestFault("Floppy API token is required")
 	}
 	baseURL := ""
+	if len(connectionBaseURL) > 0 {
+		baseURL = strings.TrimSpace(connectionBaseURL[0])
+	}
 	if config != nil {
-		baseURL = config.GetValues()[configBaseURL]
+		if baseURL == "" {
+			baseURL = config.GetValues()[configBaseURL]
+		}
+		if baseURL == "" {
+			baseURL = config.GetSecretValues()[configBaseURL]
+		}
 	}
 	client, err := newAPIClient(baseURL, token, s.http)
 	if err != nil {
@@ -252,8 +261,11 @@ func (s *Server) client(requestedCapability string, config *pluginv1.WatchSyncPr
 	return client, nil
 }
 
-func credentials(token string) *pluginv1.WatchSyncCredentials {
-	return &pluginv1.WatchSyncCredentials{AccessToken: strings.TrimSpace(token), TokenType: "Bearer"}
+func credentials(token, baseURL string) *pluginv1.WatchSyncCredentials {
+	return &pluginv1.WatchSyncCredentials{
+		AccessToken: strings.TrimSpace(token), TokenType: "Bearer",
+		SecretAttributes: map[string]string{configBaseURL: strings.TrimSpace(baseURL)},
+	}
 }
 
 func cloneCredentials(value *pluginv1.WatchSyncCredentials) *pluginv1.WatchSyncCredentials {

@@ -15,10 +15,10 @@ The plugin deliberately does not advertise favorites, watchlists, or unwatched e
 
 ## Setup
 
-1. Install the plugin and set **Base URL** to the root URL of the Floppy instance, such as `https://floppy.example.com`.
-2. In Silo, connect each profile with that Floppy user's API token.
+1. Install the plugin.
+2. In Silo's watch-provider settings, connect each profile with its Floppy server URL and that Floppy user's API token.
 
-The base URL is installation-wide configuration. Tokens are profile-scoped credentials encrypted and owned by the Silo host; the plugin receives them only for the duration of an RPC and does not store or log them.
+The server URL and token are profile-scoped connection data encrypted and owned by the Silo host. Different profiles can connect to different Floppy servers. A saved installation-wide URL from plugin v0.1.0 remains an invisible upgrade fallback for existing connections, but v0.2.0 no longer exposes or accepts a global Floppy server setting and every new connection supplies its own URL.
 
 The plugin requires a Floppy release that provides:
 
