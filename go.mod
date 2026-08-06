@@ -3,7 +3,7 @@ module github.com/Silo-Server/silo-plugin-watchprovider-floppy
 go 1.26.0
 
 require (
-	github.com/Silo-Server/silo-plugin-sdk v0.12.1-0.20260806005641-c33f66caa5a9
+	github.com/Silo-Server/silo-plugin-sdk v0.12.1-0.20260806010851-d4b0770d7342
 	google.golang.org/protobuf v1.36.11
 )
 
