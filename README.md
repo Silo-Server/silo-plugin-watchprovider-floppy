@@ -29,7 +29,7 @@ The plugin requires a Floppy release that provides:
 
 ## Development
 
-The plugin depends on `silo-plugin-sdk` v0.13.2 or newer.
+The plugin currently pins `silo-plugin-sdk` v0.13.2 in `go.mod`.
 
 ```bash
 make test
@@ -38,6 +38,12 @@ make build
 ```
 
 `make build-all` produces static binaries for the platforms declared in `manifest.json`.
+
+## Contributing
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Changes to
+authentication, reconciliation, idempotency, or the watch-sync contract should
+start as an issue.
 
 ## License
 
