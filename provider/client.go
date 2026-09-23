@@ -25,10 +25,14 @@ const (
 	defaultRequestTimeout = 110 * time.Second
 )
 
+// apiClient serves one RPC; it is not shared across calls.
 type apiClient struct {
 	baseURL *url.URL
 	token   string
 	http    *http.Client
+	// tokenValid records that validate-token accepted the token during this
+	// call, so a 403 from a Bearer route means a missing scope.
+	tokenValid bool
 }
 
 func newAPIClient(rawBaseURL, token string, httpClient *http.Client) (*apiClient, error) {
@@ -54,17 +58,24 @@ func (c *apiClient) endpoint(path string, query url.Values) string {
 }
 
 func (c *apiClient) do(ctx context.Context, method, path string, query url.Values, payload, output any, tokenScheme string) *pluginv1.WatchSyncFault {
+	_, fault := c.request(ctx, method, path, query, payload, output, tokenScheme)
+	return fault
+}
+
+// request is do plus the HTTP status, which is zero when no response arrived.
+// Callers use it when one status needs handling beyond the shared fault.
+func (c *apiClient) request(ctx context.Context, method, path string, query url.Values, payload, output any, tokenScheme string) (int, *pluginv1.WatchSyncFault) {
 	var body io.Reader
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
 		if err != nil {
-			return permanentFault("Floppy request could not be encoded")
+			return 0, permanentFault("Floppy request could not be encoded")
 		}
 		body = bytes.NewReader(encoded)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.endpoint(path, query), body)
 	if err != nil {
-		return permanentFault("Floppy request could not be created")
+		return 0, permanentFault("Floppy request could not be created")
 	}
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -74,22 +85,22 @@ func (c *apiClient) do(ctx context.Context, method, path string, query url.Value
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return temporaryFault("Floppy is temporarily unreachable", 0)
+		return 0, temporaryFault("Floppy is temporarily unreachable", 0)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return faultForHTTPResponse(resp)
+		return resp.StatusCode, faultForHTTPResponse(resp)
 	}
 	if output == nil || resp.StatusCode == http.StatusNoContent {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes))
-		return nil
+		return resp.StatusCode, nil
 	}
 	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes))
 	if err := decoder.Decode(output); err != nil {
-		return temporaryFault("Floppy returned an unreadable response", 0)
+		return resp.StatusCode, temporaryFault("Floppy returned an unreadable response", 0)
 	}
-	return nil
+	return resp.StatusCode, nil
 }
 
 func faultForHTTPResponse(resp *http.Response) *pluginv1.WatchSyncFault {
