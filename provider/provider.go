@@ -82,10 +82,12 @@ func (s *Server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 		return &pluginv1.WatchSyncApplyEventsResponse{Fault: fault}, nil
 	}
 	// Bound the whole call, including a request still in flight when the
-	// budget runs out, below the host's RPC deadline.
-	ctx, cancel := context.WithTimeout(ctx, defaultRequestTimeout)
-	defer cancel()
+	// budget runs out, below the host's RPC deadline: an interrupted request
+	// becomes a retry for its event, and the finished results still reach the
+	// host in time.
 	budget := applyEventsTimeBox(ctx)
+	ctx, cancel := context.WithTimeout(ctx, applyEventsRequestLimit(ctx))
+	defer cancel()
 	startedAt := s.clock()
 	events := req.GetEvents()
 	response := &pluginv1.WatchSyncApplyEventsResponse{
@@ -117,6 +119,17 @@ func applyEventsTimeBox(ctx context.Context) time.Duration {
 		budget = min(budget, time.Until(deadline)-applyEventsDeadlineMargin)
 	}
 	return budget
+}
+
+// applyEventsRequestLimit bounds every request of one ApplyEvents call: the
+// client's request timeout, cut to end applyEventsDeadlineMargin before the
+// call's deadline.
+func applyEventsRequestLimit(ctx context.Context) time.Duration {
+	limit := defaultRequestTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		limit = min(limit, max(time.Until(deadline)-applyEventsDeadlineMargin, 0))
+	}
+	return limit
 }
 
 func (s *Server) ListRemoteState(ctx context.Context, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {

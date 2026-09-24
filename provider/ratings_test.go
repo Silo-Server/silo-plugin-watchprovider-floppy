@@ -1089,3 +1089,20 @@ func TestListRatingsForbiddenIsAScopeFaultOnlyForAValidToken(t *testing.T) {
 		})
 	}
 }
+
+func TestApplyEventsRequestLimitEndsBeforeTheHostDeadline(t *testing.T) {
+	t.Parallel()
+	if got := applyEventsRequestLimit(context.Background()); got != defaultRequestTimeout {
+		t.Fatalf("limit without a deadline = %s, want %s", got, defaultRequestTimeout)
+	}
+	near, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if got := applyEventsRequestLimit(near); got > 30*time.Second-applyEventsDeadlineMargin || got < 20*time.Second {
+		t.Fatalf("limit with a 30s deadline = %s, want just under 25s", got)
+	}
+	past, cancelPast := context.WithTimeout(context.Background(), time.Second)
+	defer cancelPast()
+	if got := applyEventsRequestLimit(past); got != 0 {
+		t.Fatalf("limit inside the margin = %s, want 0", got)
+	}
+}
