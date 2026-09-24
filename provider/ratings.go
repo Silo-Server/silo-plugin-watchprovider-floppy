@@ -77,8 +77,8 @@ func (s *Server) listRatings(ctx context.Context, client *apiClient, req *plugin
 		"direction": {"asc"},
 	}
 	var upstream ratedMediaResponse
-	if requestFault := client.do(ctx, http.MethodGet, "/api/v1/media/"+token.Phase+"/", query, nil, &upstream, "Bearer"); requestFault != nil {
-		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: requestFault}, nil
+	if status, requestFault := client.request(ctx, http.MethodGet, "/api/v1/media/"+token.Phase+"/", query, nil, &upstream, "Bearer"); requestFault != nil {
+		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: ratingReadFault(ctx, client, status, requestFault)}, nil
 	}
 	results := upstream.Results
 	if token.Offset > 0 {
@@ -226,7 +226,7 @@ func resolveTitleScore(ctx context.Context, client *apiClient, floppyMediaType, 
 	case status == http.StatusNotFound:
 		return 0, temporaryFault(ratingsChangedMessage, 0)
 	case fault != nil:
-		return 0, fault
+		return 0, ratingReadFault(ctx, client, status, fault)
 	}
 	if !title.perPlay {
 		if latest := latestScored(title.rows); latest != nil {
@@ -538,6 +538,25 @@ func ratingFailure(ctx context.Context, client *apiClient, eventID string, statu
 		return nil, fault
 	}
 	return resultFromFault(eventID, fault), nil
+}
+
+// ratingReadFault maps a failed rating read. As with writes, a 403 from a
+// Bearer route is a missing scope once validate-token accepts the token, and a
+// credential fault otherwise.
+func ratingReadFault(ctx context.Context, client *apiClient, status int, fault *pluginv1.WatchSyncFault) *pluginv1.WatchSyncFault {
+	if status != http.StatusForbidden {
+		return fault
+	}
+	if !client.tokenValid {
+		if _, validateFault := validateAccount(ctx, client); validateFault != nil {
+			return validateFault
+		}
+		client.tokenValid = true
+	}
+	return &pluginv1.WatchSyncFault{
+		Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMISSION_DENIED,
+		SafeMessage: "The Floppy API token needs the watchlist:read scope to import ratings",
+	}
 }
 
 func ratingResult(eventID string, changed bool) *pluginv1.WatchSyncApplyResult {

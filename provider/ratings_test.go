@@ -1045,3 +1045,47 @@ func historyRow(id int64, score any, status int, created, endDate string) map[st
 		"notes": "", "source": "",
 	}
 }
+
+func TestListRatingsForbiddenIsAScopeFaultOnlyForAValidToken(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name           string
+		validateStatus int
+		wantCode       pluginv1.WatchSyncFaultCode
+	}{
+		{name: "token lacks watchlist:read", wantCode: pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMISSION_DENIED},
+		{name: "token revoked", validateStatus: http.StatusUnauthorized, wantCode: pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			validates := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/apis/listenbrainz/1/validate-token" {
+					validates++
+					if test.validateStatus != 0 {
+						w.WriteHeader(test.validateStatus)
+						return
+					}
+					writeJSON(t, w, map[string]any{"valid": true, "user_name": "viewer"})
+					return
+				}
+				w.WriteHeader(http.StatusForbidden)
+			}))
+			defer upstream.Close()
+
+			response, err := NewServer(upstream.Client()).ListRemoteState(context.Background(), &pluginv1.WatchSyncListRemoteStateRequest{
+				Context: authenticatedContext(upstream.URL), StateKinds: ratingKinds,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.GetFault().GetCode() != test.wantCode || validates != 1 || len(response.GetItems()) != 0 {
+				t.Fatalf("fault = %#v, validate calls = %d", response.GetFault(), validates)
+			}
+			if test.wantCode == pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_PERMISSION_DENIED &&
+				!strings.Contains(response.GetFault().GetSafeMessage(), "watchlist:read") {
+				t.Fatalf("message = %q, want the missing scope named", response.GetFault().GetSafeMessage())
+			}
+		})
+	}
+}
