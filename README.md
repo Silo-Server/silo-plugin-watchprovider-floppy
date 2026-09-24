@@ -57,7 +57,7 @@ The plugin requires a Floppy release that provides:
 
 ## Development
 
-The plugin builds against the `silo-plugin-sdk` rating contract (v0.17.0 once tagged).
+The plugin builds against the `silo-plugin-sdk` rating contract (v0.17.0).
 
 ```bash
 make test
