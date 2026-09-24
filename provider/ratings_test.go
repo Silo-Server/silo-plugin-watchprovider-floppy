@@ -410,6 +410,49 @@ func TestListRatingsEndsThePageWhenTheTimeBoxRunsOut(t *testing.T) {
 	}
 }
 
+func TestListRatingsKeepsResolvedTitlesWhenTheDeadlineCutsARead(t *testing.T) {
+	t.Parallel()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/604/history/") {
+			// Floppy is still working on this read when the call's deadline ends.
+			select {
+			case <-r.Context().Done():
+			case <-time.After(10 * time.Second):
+			}
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/history/") {
+			serveRatedHistory(t, w, r, map[string]any{"movie/603": 7})
+			return
+		}
+		writeJSON(t, w, ratedPage(20, 3, 0, "",
+			ratedEntry(1, 7, ratedItem("movie", "603", "The Matrix", "", nil)),
+			ratedEntry(2, 6, ratedItem("movie", "604", "The Matrix Reloaded", "", nil)),
+			ratedEntry(3, 9, ratedItem("movie", "605", "The Matrix Revolutions", "", nil)),
+		))
+	}))
+	defer upstream.Close()
+
+	// Requests may run until half a second before the margin; the fixed clock
+	// keeps the time box from ending the page first.
+	server := NewServer(upstream.Client())
+	fixed := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	server.now = func() time.Time { return fixed }
+	ctx, cancel := context.WithTimeout(context.Background(), syncDeadlineMargin+500*time.Millisecond)
+	defer cancel()
+	response, err := server.ListRemoteState(ctx, &pluginv1.WatchSyncListRemoteStateRequest{
+		Context: authenticatedContext(upstream.URL), StateKinds: ratingKinds,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, fault := ratingTraversalFromRequest(&pluginv1.WatchSyncListRemoteStateRequest{PageToken: response.GetNextPageToken()})
+	if response.GetFault() != nil || fault != nil || len(response.GetItems()) != 1 ||
+		next != (ratingTraversal{Phase: floppyMovie, Offset: 1, LastKey: "item:1"}) {
+		t.Fatalf("response = %#v, next = %#v, want the first title and a page ending after it", response, next)
+	}
+}
+
 func TestListRatingsChecksThePageOverlap(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {

@@ -123,6 +123,14 @@ func (s *Server) listRatings(ctx context.Context, client *apiClient, req *plugin
 		seen[key] = struct{}{}
 		score, resolveFault := resolveTitleScore(ctx, client, token.Phase, tmdbID, entry.Score)
 		if resolveFault != nil {
+			if ctx.Err() != nil && index > 0 && ratingListingKey(results[index-1]) != "" {
+				// The request deadline cut this read short: keep the titles
+				// already resolved and end the page after the previous entry,
+				// as the time box does, so a retry makes progress.
+				results = results[:index]
+				more = true
+				break
+			}
 			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: resolveFault}, nil
 		}
 		response.Items = append(response.Items, ratingState(token.Phase, entry, tmdbID, score))
