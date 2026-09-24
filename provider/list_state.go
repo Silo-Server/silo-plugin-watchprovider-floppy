@@ -73,7 +73,7 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: temporaryFault("Floppy returned history pages without a usable timestamp", 0)}, nil
 		}
 		token.Offset = nextOffset
-		response.NextPageToken = nextPageToken(token)
+		response.NextPageToken = encodePageToken(token)
 	} else if nextCursor := providerNextCursor(cursor, token.HighWater); nextCursor != "" {
 		response.NextCursor = nextCursor
 	}
@@ -137,7 +137,7 @@ func (s *Server) listProgress(ctx context.Context, client *apiClient, req *plugi
 		last := page[len(page)-1]
 		token.BoundaryAt = last.updatedAt
 		token.BoundaryKey = last.key
-		response.NextPageToken = nextPageToken(token)
+		response.NextPageToken = encodePageToken(token)
 	} else if nextCursor := providerNextCursor(cursor, token.HighWater); nextCursor != "" {
 		response.NextCursor = nextCursor
 	}

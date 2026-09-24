@@ -19,11 +19,19 @@ const (
 	capabilityID    = "floppy"
 	configBaseURL   = "floppy.base_url"
 	defaultPageSize = 50
+	// ApplyEvents stops starting new events, and a rating snapshot page stops
+	// starting history reads, after this long, or sooner when the call's
+	// deadline, less syncDeadlineMargin, comes first. A cold Floppy write can
+	// trigger a slow metadata fetch, and the host must receive the finished
+	// results before its RPC deadline.
+	syncBudget         = 90 * time.Second
+	syncDeadlineMargin = 5 * time.Second
 )
 
 type Server struct {
 	pluginv1.UnimplementedWatchSyncProviderServer
 	http *http.Client
+	now  func() time.Time
 }
 
 func NewServer(httpClient *http.Client) *Server {
@@ -74,10 +82,26 @@ func (s *Server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 	if fault != nil {
 		return &pluginv1.WatchSyncApplyEventsResponse{Fault: fault}, nil
 	}
+	// Bound the whole call, including a request still in flight when the
+	// budget runs out, below the host's RPC deadline: an interrupted request
+	// becomes a retry for its event, and the finished results still reach the
+	// host in time.
+	budget := syncTimeBox(ctx)
+	ctx, cancel := context.WithTimeout(ctx, syncRequestLimit(ctx))
+	defer cancel()
+	startedAt := s.clock()
+	events := req.GetEvents()
 	response := &pluginv1.WatchSyncApplyEventsResponse{
-		Results: make([]*pluginv1.WatchSyncApplyResult, 0, len(req.GetEvents())),
+		Results: make([]*pluginv1.WatchSyncApplyResult, 0, len(events)),
 	}
-	for _, event := range req.GetEvents() {
+	for index, event := range events {
+		if s.clock().Sub(startedAt) >= budget {
+			for _, deferred := range events[index:] {
+				response.Results = append(response.Results, resultFromFault(deferred.GetEventId(),
+					temporaryFault("Floppy sync time limit reached; the event will be retried", 0)))
+			}
+			break
+		}
 		result, connectionFault := s.applyEvent(ctx, client, event)
 		if connectionFault != nil {
 			return &pluginv1.WatchSyncApplyEventsResponse{Fault: connectionFault}, nil
@@ -85,6 +109,26 @@ func (s *Server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 		response.Results = append(response.Results, result)
 	}
 	return response, nil
+}
+
+// syncTimeBox returns how long a call keeps starting new work: syncBudget,
+// cut short so the results still reach the host before the call's deadline.
+func syncTimeBox(ctx context.Context) time.Duration {
+	budget := syncBudget
+	if deadline, ok := ctx.Deadline(); ok {
+		budget = min(budget, time.Until(deadline)-syncDeadlineMargin)
+	}
+	return budget
+}
+
+// syncRequestLimit bounds every request of one call: the client's request
+// timeout, cut to end syncDeadlineMargin before the call's deadline.
+func syncRequestLimit(ctx context.Context) time.Duration {
+	limit := defaultRequestTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		limit = min(limit, max(time.Until(deadline)-syncDeadlineMargin, 0))
+	}
+	return limit
 }
 
 func (s *Server) ListRemoteState(ctx context.Context, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {
@@ -101,6 +145,8 @@ func (s *Server) ListRemoteState(ctx context.Context, req *pluginv1.WatchSyncLis
 		return s.listWatched(ctx, client, req)
 	case pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_PROGRESS:
 		return s.listProgress(ctx, client, req)
+	case pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_RATING:
+		return s.listRatings(ctx, client, req)
 	default:
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: &pluginv1.WatchSyncFault{
 			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_REQUEST,
@@ -112,6 +158,9 @@ func (s *Server) ListRemoteState(ctx context.Context, req *pluginv1.WatchSyncLis
 func (s *Server) applyEvent(ctx context.Context, client *apiClient, event *pluginv1.WatchSyncEvent) (*pluginv1.WatchSyncApplyResult, *pluginv1.WatchSyncFault) {
 	if event == nil || strings.TrimSpace(event.GetEventId()) == "" {
 		return rejectedResult("", "Watch event ID is required"), nil
+	}
+	if isRatingOperation(event.GetOperation()) {
+		return applyRatingEvent(ctx, client, event)
 	}
 	payload, completed, fault := payloadFromEvent(event)
 	if fault != nil {
@@ -313,7 +362,7 @@ func traversal(req *pluginv1.WatchSyncListRemoteStateRequest) (traversalToken, *
 	return token, nil
 }
 
-func nextPageToken(token traversalToken) string {
+func encodePageToken(token any) string {
 	encoded, _ := json.Marshal(token)
 	return base64.RawURLEncoding.EncodeToString(encoded)
 }
@@ -334,6 +383,13 @@ func pageSize(requested int32) int {
 		return defaultPageSize
 	}
 	return min(100, int(requested))
+}
+
+func (s *Server) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 func invalidRequestFault(message string) *pluginv1.WatchSyncFault {
