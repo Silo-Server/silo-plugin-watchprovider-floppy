@@ -21,9 +21,16 @@ var ratingKinds = []pluginv1.WatchSyncRemoteStateKind{pluginv1.WatchSyncRemoteSt
 func TestListRatingsPagesMoviesThenTVAsOneCompleteSnapshot(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
-	var requests []string
+	var requests, historyReads []string
 	var upstream *httptest.Server
 	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/history/") {
+			mu.Lock()
+			historyReads = append(historyReads, r.URL.Path)
+			mu.Unlock()
+			serveRatedHistory(t, w, r, map[string]any{"movie/603": 7.5, "movie/604": 6, "movie/605": 9.2, "tv/1668": 10})
+			return
+		}
 		query := r.URL.Query()
 		if r.Method != http.MethodGet || r.Header.Get("Authorization") != "Bearer token" ||
 			query.Get("rating") != "rated" || query.Get("status") != "0,1,2,3,4,no_status" ||
@@ -84,10 +91,19 @@ func TestListRatingsPagesMoviesThenTVAsOneCompleteSnapshot(t *testing.T) {
 
 	mu.Lock()
 	gotRequests := append([]string(nil), requests...)
+	gotHistoryReads := append([]string(nil), historyReads...)
 	mu.Unlock()
 	wantRequests := []string{"/api/v1/media/movie/@0/2", "/api/v1/media/movie/@1/3", "/api/v1/media/tv/@0/2"}
 	if !slices.Equal(gotRequests, wantRequests) {
 		t.Fatalf("requests = %v, want %v", gotRequests, wantRequests)
+	}
+	// One history read per title; the overlap title is not read twice.
+	wantHistoryReads := []string{
+		"/api/v1/media/movie/tmdb/603/history/", "/api/v1/media/movie/tmdb/604/history/",
+		"/api/v1/media/movie/tmdb/605/history/", "/api/v1/media/tv/tmdb/1668/history/",
+	}
+	if !slices.Equal(gotHistoryReads, wantHistoryReads) {
+		t.Fatalf("history reads = %v, want %v", gotHistoryReads, wantHistoryReads)
 	}
 
 	want := []struct {
@@ -126,6 +142,10 @@ func TestListRatingsPagesMoviesThenTVAsOneCompleteSnapshot(t *testing.T) {
 func TestListRatingsSkipsUnwritableAndDuplicateTitles(t *testing.T) {
 	t.Parallel()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/media/tv/tmdb/1668/history/" {
+			serveRatedHistory(t, w, r, map[string]any{"tv/1668": 8})
+			return
+		}
 		if r.URL.Path != "/api/v1/media/tv/" {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.Error(w, "unexpected request", http.StatusBadRequest)
@@ -173,9 +193,14 @@ func TestListRatingsResolvesUnscoredTitleFromHistory(t *testing.T) {
 				// A rewatch left the newest consumption unscored.
 				ratedEntry(2, nil, ratedItem("movie", "604", "The Matrix Reloaded", "", nil)),
 			))
+		case "/api/v1/media/movie/tmdb/603/history/":
+			mu.Lock()
+			historyReads = append(historyReads, r.URL.Path+"?"+r.URL.RawQuery)
+			mu.Unlock()
+			serveRatedHistory(t, w, r, map[string]any{"movie/603": 7})
 		case "/api/v1/media/movie/tmdb/604/history/":
 			mu.Lock()
-			historyReads = append(historyReads, r.URL.RawQuery)
+			historyReads = append(historyReads, r.URL.Path+"?"+r.URL.RawQuery)
 			mu.Unlock()
 			writeJSON(t, w, historyPage(
 				historyRow(11, 6, 3, "2024-01-01T00:00:00Z", "2025-06-01T20:00:00Z"),
@@ -209,8 +234,12 @@ func TestListRatingsResolvesUnscoredTitleFromHistory(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if !slices.Equal(historyReads, []string{"limit=100&offset=0"}) {
-		t.Fatalf("history reads = %v, want one for the unscored title", historyReads)
+	want := []string{
+		"/api/v1/media/movie/tmdb/603/history/?limit=100&offset=0",
+		"/api/v1/media/movie/tmdb/604/history/?limit=100&offset=0",
+	}
+	if !slices.Equal(historyReads, want) {
+		t.Fatalf("history reads = %v, want one per rated title", historyReads)
 	}
 }
 
@@ -238,7 +267,11 @@ func TestListRatingsFailsTraversalWhenUnscoredTitleCannotBeResolved(t *testing.T
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.URL.Path == "/api/v1/media/movie/tmdb/604/history/" {
+				switch r.URL.Path {
+				case "/api/v1/media/movie/tmdb/603/history/":
+					serveRatedHistory(t, w, r, map[string]any{"movie/603": 7})
+					return
+				case "/api/v1/media/movie/tmdb/604/history/":
 					test.history(w)
 					return
 				}
@@ -263,6 +296,120 @@ func TestListRatingsFailsTraversalWhenUnscoredTitleCannotBeResolved(t *testing.T
 	}
 }
 
+func TestListRatingsReadsTheEffectiveScoreFromHistory(t *testing.T) {
+	t.Parallel()
+	perPlay := historyRow(51, nil, 3, "2024-01-01T00:00:00Z", "2024-01-01T20:00:00Z")
+	perPlay["external_id"] = nil
+	for _, test := range []struct {
+		name    string
+		listed  any
+		history []any
+		want    int32
+	}{
+		{
+			// The listing reports the newest-created consumption, which was
+			// backdated; the older one was watched more recently.
+			name: "backdated consumption", listed: 9, want: 6,
+			history: []any{
+				historyRow(11, 6, 3, "2024-01-01T00:00:00Z", "2025-06-01T20:00:00Z"),
+				historyRow(12, 9, 3, "2025-02-01T00:00:00Z", "2019-03-01T20:00:00Z"),
+			},
+		},
+		{
+			name: "single consumption", listed: 7, want: 7,
+			history: []any{historyRow(11, 7, 3, "2024-01-01T00:00:00Z", "2024-01-01T20:00:00Z")},
+		},
+		// Per-play history hides the consumptions, so the listed score stands.
+		{name: "per-play movie", listed: 8, want: 8, history: []any{perPlay}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var mu sync.Mutex
+			historyReads := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v1/media/movie/":
+					writeJSON(t, w, ratedPage(20, 1, 0, "", ratedEntry(1, test.listed, ratedItem("movie", "603", "The Matrix", "", nil))))
+				case "/api/v1/media/movie/tmdb/603/history/":
+					mu.Lock()
+					historyReads++
+					mu.Unlock()
+					writeJSON(t, w, historyPage(test.history...))
+				default:
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+					http.Error(w, "unexpected request", http.StatusBadRequest)
+				}
+			}))
+			defer upstream.Close()
+
+			response, err := NewServer(upstream.Client()).ListRemoteState(context.Background(), &pluginv1.WatchSyncListRemoteStateRequest{
+				Context: authenticatedContext(upstream.URL), StateKinds: ratingKinds,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.GetFault() != nil || len(response.GetItems()) != 1 ||
+				response.GetItems()[0].GetRating().GetRating() != test.want {
+				t.Fatalf("response = %#v, want rating %d", response, test.want)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if historyReads != 1 {
+				t.Fatalf("history reads = %d, want 1", historyReads)
+			}
+		})
+	}
+}
+
+func TestListRatingsEndsThePageWhenTheTimeBoxRunsOut(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	now := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
+	var historyReads []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/history/") {
+			// Each history read stands in for a slow Floppy request.
+			mu.Lock()
+			historyReads = append(historyReads, r.URL.Path)
+			now = now.Add(time.Minute)
+			mu.Unlock()
+			serveRatedHistory(t, w, r, map[string]any{"movie/603": 7, "movie/604": 6, "movie/605": 9})
+			return
+		}
+		writeJSON(t, w, ratedPage(20, 3, 0, "",
+			ratedEntry(1, 7, ratedItem("movie", "603", "The Matrix", "", nil)),
+			ratedEntry(2, 6, ratedItem("movie", "604", "The Matrix Reloaded", "", nil)),
+			ratedEntry(3, 9, ratedItem("movie", "605", "The Matrix Revolutions", "", nil)),
+		))
+	}))
+	defer upstream.Close()
+
+	server := NewServer(upstream.Client())
+	server.now = func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	response, err := server.ListRemoteState(context.Background(), &pluginv1.WatchSyncListRemoteStateRequest{
+		Context: authenticatedContext(upstream.URL), StateKinds: ratingKinds,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reads start at 0s and 60s; at 120s the 90-second budget is spent, and
+	// the page ends after the second title even though Floppy has no more.
+	next, fault := ratingTraversalFromRequest(&pluginv1.WatchSyncListRemoteStateRequest{PageToken: response.GetNextPageToken()})
+	if response.GetFault() != nil || fault != nil || len(response.GetItems()) != 2 ||
+		next != (ratingTraversal{Phase: floppyMovie, Offset: 2, LastKey: "item:2"}) {
+		t.Fatalf("response = %#v, next = %#v", response, next)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(historyReads) != 2 {
+		t.Fatalf("history reads = %v, want two before the time box ran out", historyReads)
+	}
+}
+
 func TestListRatingsChecksThePageOverlap(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -283,6 +430,10 @@ func TestListRatingsChecksThePageOverlap(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/v1/media/movie/tmdb/605/history/" {
+					serveRatedHistory(t, w, r, map[string]any{"movie/605": 9})
+					return
+				}
 				if query := r.URL.Query(); query.Get("offset") != "1" || query.Get("limit") != "21" {
 					t.Errorf("query = %s, want the page to start one title early", r.URL.RawQuery)
 				}
@@ -315,6 +466,10 @@ func TestListRatingsChecksThePageOverlap(t *testing.T) {
 func TestListRatingsCarriesTheLastKeyAcrossPages(t *testing.T) {
 	t.Parallel()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/media/movie/tmdb/603/history/" {
+			serveRatedHistory(t, w, r, map[string]any{"movie/603": 7})
+			return
+		}
 		writeJSON(t, w, ratedPage(2, 5, 0, "",
 			ratedEntry(1, 7, ratedItem("movie", "603", "The Matrix", "", nil)),
 			// The page ends on a title the plugin skips; the overlap still checks it.
@@ -765,19 +920,19 @@ func TestApplyEventsDefersEventsPastTheTimeBox(t *testing.T) {
 	}
 }
 
-func TestApplyEventsTimeBox(t *testing.T) {
+func TestSyncTimeBox(t *testing.T) {
 	t.Parallel()
-	if got := applyEventsTimeBox(context.Background()); got != applyEventsBudget {
-		t.Fatalf("time box without a deadline = %s, want %s", got, applyEventsBudget)
+	if got := syncTimeBox(context.Background()); got != syncBudget {
+		t.Fatalf("time box without a deadline = %s, want %s", got, syncBudget)
 	}
 	far, cancelFar := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancelFar()
-	if got := applyEventsTimeBox(far); got != applyEventsBudget {
-		t.Fatalf("time box with a distant deadline = %s, want %s", got, applyEventsBudget)
+	if got := syncTimeBox(far); got != syncBudget {
+		t.Fatalf("time box with a distant deadline = %s, want %s", got, syncBudget)
 	}
 	near, cancelNear := context.WithTimeout(context.Background(), time.Minute)
 	defer cancelNear()
-	if got := applyEventsTimeBox(near); got > time.Minute-applyEventsDeadlineMargin || got < time.Minute-applyEventsDeadlineMargin-5*time.Second {
+	if got := syncTimeBox(near); got > time.Minute-syncDeadlineMargin || got < time.Minute-syncDeadlineMargin-5*time.Second {
 		t.Fatalf("time box with a one-minute deadline = %s", got)
 	}
 }
@@ -1046,6 +1201,23 @@ func historyRow(id int64, score any, status int, created, endDate string) map[st
 	}
 }
 
+// serveRatedHistory answers a history read with one consumption holding the
+// title's score, from scores keyed "movie/603".
+func serveRatedHistory(t *testing.T, w http.ResponseWriter, r *http.Request, scores map[string]any) {
+	t.Helper()
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	score, ok := any(nil), false
+	if len(parts) == 7 && parts[6] == "history" {
+		score, ok = scores[parts[3]+"/"+parts[5]]
+	}
+	if !ok {
+		t.Errorf("unexpected history read %s %s", r.Method, r.URL.Path)
+		http.Error(w, "unexpected request", http.StatusBadRequest)
+		return
+	}
+	writeJSON(t, w, historyPage(historyRow(1, score, 3, "2024-01-01T00:00:00Z", "2024-01-01T20:00:00Z")))
+}
+
 func TestListRatingsForbiddenIsAScopeFaultOnlyForAValidToken(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
@@ -1090,19 +1262,19 @@ func TestListRatingsForbiddenIsAScopeFaultOnlyForAValidToken(t *testing.T) {
 	}
 }
 
-func TestApplyEventsRequestLimitEndsBeforeTheHostDeadline(t *testing.T) {
+func TestSyncRequestLimitEndsBeforeTheHostDeadline(t *testing.T) {
 	t.Parallel()
-	if got := applyEventsRequestLimit(context.Background()); got != defaultRequestTimeout {
+	if got := syncRequestLimit(context.Background()); got != defaultRequestTimeout {
 		t.Fatalf("limit without a deadline = %s, want %s", got, defaultRequestTimeout)
 	}
 	near, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if got := applyEventsRequestLimit(near); got > 30*time.Second-applyEventsDeadlineMargin || got < 20*time.Second {
+	if got := syncRequestLimit(near); got > 30*time.Second-syncDeadlineMargin || got < 20*time.Second {
 		t.Fatalf("limit with a 30s deadline = %s, want just under 25s", got)
 	}
 	past, cancelPast := context.WithTimeout(context.Background(), time.Second)
 	defer cancelPast()
-	if got := applyEventsRequestLimit(past); got != 0 {
+	if got := syncRequestLimit(past); got != 0 {
 		t.Fatalf("limit inside the margin = %s, want 0", got)
 	}
 }

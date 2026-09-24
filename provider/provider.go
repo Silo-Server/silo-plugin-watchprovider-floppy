@@ -19,12 +19,13 @@ const (
 	capabilityID    = "floppy"
 	configBaseURL   = "floppy.base_url"
 	defaultPageSize = 50
-	// ApplyEvents stops starting new events after this long, or sooner when
-	// the call's deadline, less applyEventsDeadlineMargin, comes first. A cold
-	// Floppy write can trigger a slow metadata fetch, and the host must receive
-	// the finished results before its RPC deadline.
-	applyEventsBudget         = 90 * time.Second
-	applyEventsDeadlineMargin = 5 * time.Second
+	// ApplyEvents stops starting new events, and a rating snapshot page stops
+	// starting history reads, after this long, or sooner when the call's
+	// deadline, less syncDeadlineMargin, comes first. A cold Floppy write can
+	// trigger a slow metadata fetch, and the host must receive the finished
+	// results before its RPC deadline.
+	syncBudget         = 90 * time.Second
+	syncDeadlineMargin = 5 * time.Second
 )
 
 type Server struct {
@@ -85,8 +86,8 @@ func (s *Server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 	// budget runs out, below the host's RPC deadline: an interrupted request
 	// becomes a retry for its event, and the finished results still reach the
 	// host in time.
-	budget := applyEventsTimeBox(ctx)
-	ctx, cancel := context.WithTimeout(ctx, applyEventsRequestLimit(ctx))
+	budget := syncTimeBox(ctx)
+	ctx, cancel := context.WithTimeout(ctx, syncRequestLimit(ctx))
 	defer cancel()
 	startedAt := s.clock()
 	events := req.GetEvents()
@@ -110,24 +111,22 @@ func (s *Server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 	return response, nil
 }
 
-// applyEventsTimeBox returns how long ApplyEvents keeps starting events:
-// applyEventsBudget, cut short so the results still reach the host before the
-// call's deadline.
-func applyEventsTimeBox(ctx context.Context) time.Duration {
-	budget := applyEventsBudget
+// syncTimeBox returns how long a call keeps starting new work: syncBudget,
+// cut short so the results still reach the host before the call's deadline.
+func syncTimeBox(ctx context.Context) time.Duration {
+	budget := syncBudget
 	if deadline, ok := ctx.Deadline(); ok {
-		budget = min(budget, time.Until(deadline)-applyEventsDeadlineMargin)
+		budget = min(budget, time.Until(deadline)-syncDeadlineMargin)
 	}
 	return budget
 }
 
-// applyEventsRequestLimit bounds every request of one ApplyEvents call: the
-// client's request timeout, cut to end applyEventsDeadlineMargin before the
-// call's deadline.
-func applyEventsRequestLimit(ctx context.Context) time.Duration {
+// syncRequestLimit bounds every request of one call: the client's request
+// timeout, cut to end syncDeadlineMargin before the call's deadline.
+func syncRequestLimit(ctx context.Context) time.Duration {
 	limit := defaultRequestTimeout
 	if deadline, ok := ctx.Deadline(); ok {
-		limit = min(limit, max(time.Until(deadline)-applyEventsDeadlineMargin, 0))
+		limit = min(limit, max(time.Until(deadline)-syncDeadlineMargin, 0))
 	}
 	return limit
 }

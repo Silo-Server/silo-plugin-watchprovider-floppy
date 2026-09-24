@@ -61,12 +61,20 @@ func (s *Server) listRatings(ctx context.Context, client *apiClient, req *plugin
 	if fault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: fault}, nil
 	}
+	// Every rated title costs a history read, so a page is time-boxed like an
+	// ApplyEvents batch and its requests end before the host's deadline.
+	budget := syncTimeBox(ctx)
+	ctx, cancel := context.WithTimeout(ctx, syncRequestLimit(ctx))
+	defer cancel()
+	startedAt := s.clock()
 	limit := min(pageSize(req.GetPageSize()), ratingPageLimit)
 	offset := token.Offset
+	overlap := 0
 	if token.Offset > 0 {
 		// Re-read the previous page's last title as the overlap check.
 		offset--
 		limit++
+		overlap = 1
 	}
 	query := url.Values{
 		"limit":     {strconv.Itoa(limit)},
@@ -96,7 +104,7 @@ func (s *Server) listRatings(ctx context.Context, client *apiClient, req *plugin
 	// snapshot and returns no durable cursor.
 	response := &pluginv1.WatchSyncListRemoteStateResponse{CompleteSnapshot: true}
 	seen := make(map[string]struct{}, len(results))
-	for _, entry := range results {
+	for index, entry := range results {
 		tmdbID := ratingTitleID(token.Phase, entry)
 		if tmdbID == "" {
 			continue
@@ -105,17 +113,19 @@ func (s *Server) listRatings(ctx context.Context, client *apiClient, req *plugin
 		if _, duplicate := seen[key]; duplicate {
 			continue
 		}
-		seen[key] = struct{}{}
-		score := entry.Score
-		if score == nil {
-			// Only a title Floppy lists without a score costs a history read.
-			resolved, resolveFault := resolveTitleScore(ctx, client, token.Phase, tmdbID)
-			if resolveFault != nil {
-				return &pluginv1.WatchSyncListRemoteStateResponse{Fault: resolveFault}, nil
-			}
-			score = &resolved
+		if index > 0 && ratingListingKey(results[index-1]) != "" && s.clock().Sub(startedAt) >= budget {
+			// Out of time: end the page after the previous entry, which the
+			// next page re-reads as its overlap check.
+			results = results[:index]
+			more = true
+			break
 		}
-		response.Items = append(response.Items, ratingState(token.Phase, entry, tmdbID, *score))
+		seen[key] = struct{}{}
+		score, resolveFault := resolveTitleScore(ctx, client, token.Phase, tmdbID, entry.Score)
+		if resolveFault != nil {
+			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: resolveFault}, nil
+		}
+		response.Items = append(response.Items, ratingState(token.Phase, entry, tmdbID, score))
 	}
 
 	switch {
@@ -129,9 +139,9 @@ func (s *Server) listRatings(ctx context.Context, client *apiClient, req *plugin
 		if lastKey == "" {
 			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: temporaryFault("Floppy returned invalid pagination", 0)}, nil
 		}
-		// The next page starts after the last entry this page returned.
+		// The next page starts after the last entry this page covered.
 		response.NextPageToken = encodePageToken(ratingTraversal{
-			Phase: token.Phase, Offset: offset + len(upstream.Results), LastKey: lastKey,
+			Phase: token.Phase, Offset: offset + overlap + len(results), LastKey: lastKey,
 		})
 	case token.Phase == floppyMovie:
 		response.NextPageToken = encodePageToken(ratingTraversal{Phase: floppyTV})
@@ -216,11 +226,16 @@ func ratingState(phase string, entry ratedMediaEntry, tmdbID string, score float
 	}
 }
 
-// resolveTitleScore returns the score Floppy shows for a rated title whose
-// listed entry has none. The listing reports the newest consumption's own
-// score, which a rewatch leaves empty, while Floppy's rated filter and UI read
-// the most recently active consumption that has a score.
-func resolveTitleScore(ctx context.Context, client *apiClient, floppyMediaType, tmdbID string) (float64, *pluginv1.WatchSyncFault) {
+// resolveTitleScore returns the score Floppy shows for a rated title, read from
+// its consumption history. The listing alone cannot be trusted: it reports the
+// newest-created consumption's own score, which a rewatch leaves empty and a
+// backdated entry leaves stale, while Floppy's rated filter and UI read the
+// most recently active consumption that has a score. The listing does not say
+// whether a title has more than one consumption, so every title costs a read.
+//
+// A movie with per-play history lists its plays in place of its consumptions,
+// so the listed score is the only one available for it.
+func resolveTitleScore(ctx context.Context, client *apiClient, floppyMediaType, tmdbID string, listed *float64) (float64, *pluginv1.WatchSyncFault) {
 	title, status, fault := loadTitleConsumptions(ctx, client, floppyMediaType, tmdbID)
 	switch {
 	case status == http.StatusNotFound:
@@ -232,6 +247,8 @@ func resolveTitleScore(ctx context.Context, client *apiClient, floppyMediaType, 
 		if latest := latestScored(title.rows); latest != nil {
 			return *latest.score, nil
 		}
+	} else if listed != nil {
+		return *listed, nil
 	}
 	return 0, temporaryFault("Floppy did not return the entry that holds a rated title's score; the sync will retry", 0)
 }
