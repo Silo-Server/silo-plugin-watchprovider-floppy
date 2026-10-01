@@ -216,17 +216,15 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 		mu.Lock()
 		queries = append(queries, r.URL.Query())
 		mu.Unlock()
-		offset := r.URL.Query().Get("offset")
-		if offset == "0" {
-			writeJSON(t, w, map[string]any{
-				"pagination": map[string]any{"total": 2, "limit": 1, "offset": 0, "next": nil},
-				"results":    []any{historyDayPayload(playedAt)},
-			})
-			return
+		// The first page reports a smaller limit than requested; the second
+		// starts one entry early to re-read the first page's last entry.
+		limit := 1
+		if r.URL.Query().Get("end_date") != "" {
+			limit = 101
 		}
 		writeJSON(t, w, map[string]any{
-			"pagination": map[string]any{"total": 2, "limit": 1, "offset": 1, "next": nil},
-			"results":    []any{},
+			"pagination": map[string]any{"total": 2, "limit": limit, "offset": 0, "next": nil},
+			"results":    []any{historyDayPayload(playedAt)},
 		})
 	}))
 	defer upstream.Close()
@@ -254,13 +252,13 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.GetNextPageToken() != "" || second.GetNextCursor() != playedAt.Add(-providerCursorOverlap).Format(time.RFC3339Nano) || !second.GetCompleteSnapshot() {
+	if second.GetNextPageToken() != "" || second.GetNextCursor() != watchedCursorPrefix+playedAt.Add(-providerCursorOverlap).Format(time.RFC3339Nano) || !second.GetCompleteSnapshot() {
 		t.Fatalf("second = %#v", second)
 	}
 	mu.Lock()
 	gotQueries := append([]url.Values(nil), queries...)
 	mu.Unlock()
-	if len(gotQueries) != 2 || gotQueries[0].Get("end_date") != "" || gotQueries[1].Get("end_date") != "2026-08-06" || gotQueries[1].Get("offset") != "1" {
+	if len(gotQueries) != 2 || gotQueries[0].Get("flat") != "true" || gotQueries[0].Get("media_type") != "movie,tv" || gotQueries[0].Get("end_date") != "" || gotQueries[1].Get("end_date") != "2026-08-06" || gotQueries[1].Get("offset") != "0" || gotQueries[1].Get("limit") != "101" {
 		t.Fatalf("queries = %#v", gotQueries)
 	}
 }
@@ -490,16 +488,21 @@ func progressPayload(mediaID string, updatedAt time.Time) map[string]any {
 func TestCompletedHistoryEntry(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
-		status string
-		want   bool
+		mediaType string
+		status    string
+		want      bool
 	}{
-		{status: "Completed", want: true},
-		{status: " completed ", want: true},
-		{status: "In progress", want: false},
-		{status: "", want: false},
+		{mediaType: "movie", status: "Completed", want: true},
+		{mediaType: "movie", status: " completed ", want: true},
+		{mediaType: "movie", status: "In progress", want: false},
+		{mediaType: "movie", status: "", want: false},
+		{mediaType: "episode", status: "Completed", want: true},
+		{mediaType: "episode", status: "In progress", want: false},
+		// Floppy before v26.9.24 sends no status for an episode.
+		{mediaType: "episode", status: "", want: true},
 	} {
-		if got := completedHistoryEntry(historyEntry{Status: test.status}); got != test.want {
-			t.Errorf("completedHistoryEntry(%q) = %t, want %t", test.status, got, test.want)
+		if got := completedHistoryEntry(historyEntry{MediaType: test.mediaType, Status: test.status}); got != test.want {
+			t.Errorf("completedHistoryEntry(%s, %q) = %t, want %t", test.mediaType, test.status, got, test.want)
 		}
 	}
 }

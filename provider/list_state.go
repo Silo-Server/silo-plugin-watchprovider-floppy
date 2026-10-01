@@ -13,10 +13,23 @@ import (
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 )
 
-const providerCursorOverlap = 2 * time.Second
+const (
+	providerCursorOverlap = 2 * time.Second
+	// historyMediaTypes limits history reads to the plays this plugin syncs;
+	// Floppy also tracks music, podcasts, games, and books. Floppy v26.8.6
+	// and later read "tv" as episode plays.
+	historyMediaTypes = "movie,tv"
+	// watchedCursorPrefix marks a watched cursor written since the plugin read
+	// Floppy's flat history. Releases up to 0.3.0 skipped episode plays and a
+	// day's entries past the 30th, so a cursor without the prefix counts as
+	// none, and the next sync imports the whole history again.
+	watchedCursorPrefix = "flat:"
+
+	historyChangedMessage = "Floppy history changed during the sync; it will start over"
+)
 
 func (s *Server) listWatched(ctx context.Context, client *apiClient, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {
-	cursor, fault := parseCursor(req.GetCursor())
+	cursor, fault := parseWatchedCursor(req.GetCursor())
 	if fault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: fault}, nil
 	}
@@ -24,10 +37,24 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 	if fault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: fault}, nil
 	}
+	if token.Offset > 0 && token.BoundaryKey == "" {
+		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: invalidRequestFault("Floppy page token is invalid")}, nil
+	}
+	// Floppy builds the history again for every page, so an entry removed
+	// mid-traversal shifts the offsets. A later page starts one entry early: the
+	// previous page's last entry must come back first, or the traversal starts
+	// over instead of skipping an entry the cursor then moves past.
 	limit := pageSize(req.GetPageSize())
+	offset := token.Offset
+	if token.Offset > 0 {
+		offset--
+		limit++
+	}
 	query := url.Values{
+		"flat":          {"true"},
+		"media_type":    {historyMediaTypes},
 		"limit":         {strconv.Itoa(limit)},
-		"offset":        {strconv.Itoa(token.Offset)},
+		"offset":        {strconv.Itoa(offset)},
 		"logging_style": {"sessions"},
 	}
 	if !cursor.IsZero() {
@@ -43,28 +70,34 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 	if requestFault := client.do(ctx, http.MethodGet, "/api/v1/history/", query, nil, &upstream, "Bearer"); requestFault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: requestFault}, nil
 	}
+	results := upstream.Results
+	if token.Offset > 0 {
+		if len(results) == 0 || historyBoundaryKey(results[0]) != token.BoundaryKey {
+			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: temporaryFault(historyChangedMessage, 0)}, nil
+		}
+		results = results[1:]
+	}
 	response := &pluginv1.WatchSyncListRemoteStateResponse{
 		CompleteSnapshot: cursor.IsZero(),
 	}
+	entries := historyEntries(results)
 	if token.HighWater.IsZero() {
-		token.HighWater = historyWatermark(upstream.Results)
+		token.HighWater = historyWatermark(entries)
 	}
-	for _, day := range upstream.Results {
-		for _, entry := range day.Entries {
-			if !completedHistoryEntry(entry) {
-				continue
-			}
-			watchedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt)
-			if err != nil || !watchedAt.After(cursor) || (!token.HighWater.IsZero() && watchedAt.After(token.HighWater)) {
-				continue
-			}
-			state := watchedState(entry, watchedAt)
-			if state != nil {
-				response.Items = append(response.Items, state)
-			}
+	for _, entry := range entries {
+		if !completedHistoryEntry(entry) {
+			continue
+		}
+		watchedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt)
+		if err != nil || !watchedAt.After(cursor) || (!token.HighWater.IsZero() && watchedAt.After(token.HighWater)) {
+			continue
+		}
+		state := watchedState(entry, watchedAt)
+		if state != nil {
+			response.Items = append(response.Items, state)
 		}
 	}
-	nextOffset, more, paginationFault := nextOffsetFromPagination(upstream.Pagination, token.Offset)
+	nextOffset, more, paginationFault := nextOffsetFromPagination(upstream.Pagination, offset)
 	if paginationFault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: paginationFault}, nil
 	}
@@ -72,12 +105,34 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 		if token.HighWater.IsZero() {
 			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: temporaryFault("Floppy returned history pages without a usable timestamp", 0)}, nil
 		}
+		if len(upstream.Results) == 0 || nextOffset <= token.Offset {
+			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: temporaryFault("Floppy returned invalid pagination", 0)}, nil
+		}
 		token.Offset = nextOffset
+		token.BoundaryKey = historyBoundaryKey(upstream.Results[len(upstream.Results)-1])
 		response.NextPageToken = encodePageToken(token)
 	} else if nextCursor := providerNextCursor(cursor, token.HighWater); nextCursor != "" {
-		response.NextCursor = nextCursor
+		response.NextCursor = watchedCursorPrefix + nextCursor
 	}
 	return response, nil
+}
+
+// historyBoundaryKey identifies the last entry a history result lists, for the
+// next page's overlap check: a flat entry, or the last entry of a day group.
+func historyBoundaryKey(result historyResult) string {
+	entry := result.historyEntry
+	if len(result.Entries) > 0 {
+		entry = result.Entries[len(result.Entries)-1]
+	}
+	return strings.Join([]string{entry.MediaType, rawString(entry.InstanceID), entry.Item.Source, rawString(entry.Item.MediaID), entry.PlayedAt}, "|")
+}
+
+func parseWatchedCursor(value string) (time.Time, *pluginv1.WatchSyncFault) {
+	cursor, ok := strings.CutPrefix(value, watchedCursorPrefix)
+	if !ok {
+		return time.Time{}, nil
+	}
+	return parseCursor(cursor)
 }
 
 func (s *Server) listProgress(ctx context.Context, client *apiClient, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {
@@ -187,13 +242,11 @@ func fetchProgressSnapshot(ctx context.Context, client *apiClient, cursor time.T
 	}
 }
 
-func historyWatermark(days []historyDay) time.Time {
+func historyWatermark(entries []historyEntry) time.Time {
 	var watermark time.Time
-	for _, day := range days {
-		for _, entry := range day.Entries {
-			if playedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt); err == nil && playedAt.After(watermark) {
-				watermark = playedAt
-			}
+	for _, entry := range entries {
+		if playedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt); err == nil && playedAt.After(watermark) {
+			watermark = playedAt
 		}
 	}
 	return watermark
@@ -338,6 +391,8 @@ func historyContainsEvent(ctx context.Context, client *apiClient, event *pluginv
 	}
 	occurredAt := event.GetOccurredAt().AsTime()
 	query := url.Values{
+		"flat":          {"true"},
+		"media_type":    {historyMediaTypes},
 		"start_date":    {occurredAt.Add(-24 * time.Hour).Format(time.DateOnly)},
 		"end_date":      {occurredAt.Add(24 * time.Hour).Format(time.DateOnly)},
 		"logging_style": {"sessions"},
@@ -349,18 +404,16 @@ func historyContainsEvent(ctx context.Context, client *apiClient, event *pluginv
 		if fault := client.do(ctx, http.MethodGet, "/api/v1/history/", query, nil, &upstream, "Bearer"); fault != nil {
 			return false, fault
 		}
-		for _, day := range upstream.Results {
-			for _, entry := range day.Entries {
-				if !completedHistoryEntry(entry) {
-					continue
-				}
-				playedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt)
-				if err != nil || absoluteDuration(playedAt.Sub(occurredAt)) > 2*time.Second {
-					continue
-				}
-				if mediaMatchesHistory(event.GetMedia(), entry) {
-					return true, nil
-				}
+		for _, entry := range historyEntries(upstream.Results) {
+			if !completedHistoryEntry(entry) {
+				continue
+			}
+			playedAt, err := time.Parse(time.RFC3339Nano, entry.PlayedAt)
+			if err != nil || absoluteDuration(playedAt.Sub(occurredAt)) > 2*time.Second {
+				continue
+			}
+			if mediaMatchesHistory(event.GetMedia(), entry) {
+				return true, nil
 			}
 		}
 		nextOffset, more, paginationFault := nextOffsetFromPagination(upstream.Pagination, offset)
@@ -401,7 +454,13 @@ func nextOffsetFromPagination(page pagination, current int) (int, bool, *pluginv
 }
 
 func completedHistoryEntry(entry historyEntry) bool {
-	return strings.EqualFold(strings.TrimSpace(entry.Status), "completed")
+	status := strings.TrimSpace(entry.Status)
+	if status == "" && protoMediaType(entry.MediaType) == pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE {
+		// Floppy releases before v26.9.24 omit an episode entry's status:
+		// every episode row there is a finished watch.
+		return true
+	}
+	return strings.EqualFold(status, "completed")
 }
 
 func mediaMatchesHistory(media *pluginv1.WatchSyncMedia, entry historyEntry) bool {

@@ -14,14 +14,30 @@ type pagination struct {
 	Next   string `json:"next"`
 }
 
+// historyResponse is one page of GET /api/v1/history/?flat=true, which lists
+// entries. A Floppy release before v26.8.20 ignores flat and lists day groups
+// instead, each showing at most 30 of that day's entries.
 type historyResponse struct {
-	Pagination pagination   `json:"pagination"`
-	Results    []historyDay `json:"results"`
+	Pagination pagination      `json:"pagination"`
+	Results    []historyResult `json:"results"`
 }
 
-type historyDay struct {
-	Date    string         `json:"date"`
+// historyResult is a flat entry, or a day group holding its entries.
+type historyResult struct {
+	historyEntry
 	Entries []historyEntry `json:"entries"`
+}
+
+func historyEntries(results []historyResult) []historyEntry {
+	var entries []historyEntry
+	for _, result := range results {
+		if result.Entries != nil {
+			entries = append(entries, result.Entries...)
+		} else {
+			entries = append(entries, result.historyEntry)
+		}
+	}
+	return entries
 }
 
 type historyEntry struct {
