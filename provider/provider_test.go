@@ -260,7 +260,7 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 	mu.Lock()
 	gotQueries := append([]url.Values(nil), queries...)
 	mu.Unlock()
-	if len(gotQueries) != 2 || gotQueries[0].Get("end_date") != "" || gotQueries[1].Get("end_date") != "2026-08-06" || gotQueries[1].Get("offset") != "1" {
+	if len(gotQueries) != 2 || gotQueries[0].Get("flat") != "true" || gotQueries[0].Get("end_date") != "" || gotQueries[1].Get("end_date") != "2026-08-06" || gotQueries[1].Get("offset") != "1" {
 		t.Fatalf("queries = %#v", gotQueries)
 	}
 }
@@ -490,16 +490,21 @@ func progressPayload(mediaID string, updatedAt time.Time) map[string]any {
 func TestCompletedHistoryEntry(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
-		status string
-		want   bool
+		mediaType string
+		status    string
+		want      bool
 	}{
-		{status: "Completed", want: true},
-		{status: " completed ", want: true},
-		{status: "In progress", want: false},
-		{status: "", want: false},
+		{mediaType: "movie", status: "Completed", want: true},
+		{mediaType: "movie", status: " completed ", want: true},
+		{mediaType: "movie", status: "In progress", want: false},
+		{mediaType: "movie", status: "", want: false},
+		{mediaType: "episode", status: "Completed", want: true},
+		{mediaType: "episode", status: "In progress", want: false},
+		// Floppy before v26.9.24 sends no status for an episode.
+		{mediaType: "episode", status: "", want: true},
 	} {
-		if got := completedHistoryEntry(historyEntry{Status: test.status}); got != test.want {
-			t.Errorf("completedHistoryEntry(%q) = %t, want %t", test.status, got, test.want)
+		if got := completedHistoryEntry(historyEntry{MediaType: test.mediaType, Status: test.status}); got != test.want {
+			t.Errorf("completedHistoryEntry(%s, %q) = %t, want %t", test.mediaType, test.status, got, test.want)
 		}
 	}
 }

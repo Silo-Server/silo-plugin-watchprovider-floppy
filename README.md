@@ -47,13 +47,15 @@ The server URL and token are profile-scoped connection data encrypted and owned 
 The plugin requires a Floppy release that provides:
 
 - `GET /apis/listenbrainz/1/validate-token`
-- `GET /api/v1/history/`
+- `GET /api/v1/history/`, with `flat=true` for the full history (Floppy v26.8.20 and later)
 - `GET /api/v1/media/{media_type}/` with the `rating=rated` filter
 - `PATCH /api/v1/media/{media_type}/{source}/{media_id}/`
 - `GET /api/v1/media/{media_type}/{source}/{media_id}/history/`
 - `PATCH /api/v1/media/{media_type}/{source}/{media_id}/history/{consumption_id}/`
 - `GET /api/v1/playback/progress/`
 - `POST /api/v1/scrobble/`
+
+A Floppy release before v26.8.20 ignores `flat` and groups history by day, listing at most 30 entries a day. The plugin still reads that shape, but it misses the rest of a busier day, both when importing history and when checking whether a completed watch was already sent.
 
 ## Development
 
