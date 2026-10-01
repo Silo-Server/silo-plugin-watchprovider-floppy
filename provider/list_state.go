@@ -24,6 +24,8 @@ const (
 	// day's entries past the 30th, so a cursor without the prefix counts as
 	// none, and the next sync imports the whole history again.
 	watchedCursorPrefix = "flat:"
+
+	historyChangedMessage = "Floppy history changed during the sync; it will start over"
 )
 
 func (s *Server) listWatched(ctx context.Context, client *apiClient, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {
@@ -35,12 +37,24 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 	if fault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: fault}, nil
 	}
+	if token.Offset > 0 && token.BoundaryKey == "" {
+		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: invalidRequestFault("Floppy page token is invalid")}, nil
+	}
+	// Floppy builds the history again for every page, so an entry removed
+	// mid-traversal shifts the offsets. A later page starts one entry early: the
+	// previous page's last entry must come back first, or the traversal starts
+	// over instead of skipping an entry the cursor then moves past.
 	limit := pageSize(req.GetPageSize())
+	offset := token.Offset
+	if token.Offset > 0 {
+		offset--
+		limit++
+	}
 	query := url.Values{
 		"flat":          {"true"},
 		"media_type":    {historyMediaTypes},
 		"limit":         {strconv.Itoa(limit)},
-		"offset":        {strconv.Itoa(token.Offset)},
+		"offset":        {strconv.Itoa(offset)},
 		"logging_style": {"sessions"},
 	}
 	if !cursor.IsZero() {
@@ -56,10 +70,17 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 	if requestFault := client.do(ctx, http.MethodGet, "/api/v1/history/", query, nil, &upstream, "Bearer"); requestFault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: requestFault}, nil
 	}
+	results := upstream.Results
+	if token.Offset > 0 {
+		if len(results) == 0 || historyBoundaryKey(results[0]) != token.BoundaryKey {
+			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: temporaryFault(historyChangedMessage, 0)}, nil
+		}
+		results = results[1:]
+	}
 	response := &pluginv1.WatchSyncListRemoteStateResponse{
 		CompleteSnapshot: cursor.IsZero(),
 	}
-	entries := upstream.entries()
+	entries := historyEntries(results)
 	if token.HighWater.IsZero() {
 		token.HighWater = historyWatermark(entries)
 	}
@@ -76,7 +97,7 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 			response.Items = append(response.Items, state)
 		}
 	}
-	nextOffset, more, paginationFault := nextOffsetFromPagination(upstream.Pagination, token.Offset)
+	nextOffset, more, paginationFault := nextOffsetFromPagination(upstream.Pagination, offset)
 	if paginationFault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: paginationFault}, nil
 	}
@@ -84,12 +105,26 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 		if token.HighWater.IsZero() {
 			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: temporaryFault("Floppy returned history pages without a usable timestamp", 0)}, nil
 		}
+		if len(upstream.Results) == 0 || nextOffset <= token.Offset {
+			return &pluginv1.WatchSyncListRemoteStateResponse{Fault: temporaryFault("Floppy returned invalid pagination", 0)}, nil
+		}
 		token.Offset = nextOffset
+		token.BoundaryKey = historyBoundaryKey(upstream.Results[len(upstream.Results)-1])
 		response.NextPageToken = encodePageToken(token)
 	} else if nextCursor := providerNextCursor(cursor, token.HighWater); nextCursor != "" {
 		response.NextCursor = watchedCursorPrefix + nextCursor
 	}
 	return response, nil
+}
+
+// historyBoundaryKey identifies the last entry a history result lists, for the
+// next page's overlap check: a flat entry, or the last entry of a day group.
+func historyBoundaryKey(result historyResult) string {
+	entry := result.historyEntry
+	if len(result.Entries) > 0 {
+		entry = result.Entries[len(result.Entries)-1]
+	}
+	return strings.Join([]string{entry.MediaType, rawString(entry.InstanceID), entry.Item.Source, rawString(entry.Item.MediaID), entry.PlayedAt}, "|")
 }
 
 func parseWatchedCursor(value string) (time.Time, *pluginv1.WatchSyncFault) {
@@ -369,7 +404,7 @@ func historyContainsEvent(ctx context.Context, client *apiClient, event *pluginv
 		if fault := client.do(ctx, http.MethodGet, "/api/v1/history/", query, nil, &upstream, "Bearer"); fault != nil {
 			return false, fault
 		}
-		for _, entry := range upstream.entries() {
+		for _, entry := range historyEntries(upstream.Results) {
 			if !completedHistoryEntry(entry) {
 				continue
 			}

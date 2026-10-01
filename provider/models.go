@@ -28,9 +28,9 @@ type historyResult struct {
 	Entries []historyEntry `json:"entries"`
 }
 
-func (r historyResponse) entries() []historyEntry {
+func historyEntries(results []historyResult) []historyEntry {
 	var entries []historyEntry
-	for _, result := range r.Results {
+	for _, result := range results {
 		if result.Entries != nil {
 			entries = append(entries, result.Entries...)
 		} else {

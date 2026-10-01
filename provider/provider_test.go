@@ -216,17 +216,15 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 		mu.Lock()
 		queries = append(queries, r.URL.Query())
 		mu.Unlock()
-		offset := r.URL.Query().Get("offset")
-		if offset == "0" {
-			writeJSON(t, w, map[string]any{
-				"pagination": map[string]any{"total": 2, "limit": 1, "offset": 0, "next": nil},
-				"results":    []any{historyDayPayload(playedAt)},
-			})
-			return
+		// The first page reports a smaller limit than requested; the second
+		// starts one entry early to re-read the first page's last entry.
+		limit := 1
+		if r.URL.Query().Get("end_date") != "" {
+			limit = 101
 		}
 		writeJSON(t, w, map[string]any{
-			"pagination": map[string]any{"total": 2, "limit": 1, "offset": 1, "next": nil},
-			"results":    []any{},
+			"pagination": map[string]any{"total": 2, "limit": limit, "offset": 0, "next": nil},
+			"results":    []any{historyDayPayload(playedAt)},
 		})
 	}))
 	defer upstream.Close()
@@ -260,7 +258,7 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 	mu.Lock()
 	gotQueries := append([]url.Values(nil), queries...)
 	mu.Unlock()
-	if len(gotQueries) != 2 || gotQueries[0].Get("flat") != "true" || gotQueries[0].Get("media_type") != "movie,tv" || gotQueries[0].Get("end_date") != "" || gotQueries[1].Get("end_date") != "2026-08-06" || gotQueries[1].Get("offset") != "1" {
+	if len(gotQueries) != 2 || gotQueries[0].Get("flat") != "true" || gotQueries[0].Get("media_type") != "movie,tv" || gotQueries[0].Get("end_date") != "" || gotQueries[1].Get("end_date") != "2026-08-06" || gotQueries[1].Get("offset") != "0" || gotQueries[1].Get("limit") != "101" {
 		t.Fatalf("queries = %#v", gotQueries)
 	}
 }

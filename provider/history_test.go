@@ -18,12 +18,12 @@ import (
 // Floppy clamps limit to 200 and reports the limit it used. A Floppy release
 // before v26.8.20 ignores flat, which ignoreFlat reproduces.
 type fakeFloppyHistory struct {
-	t *testing.T
-	// entries are newest first, as Floppy lists them.
-	entries    []map[string]any
+	t          *testing.T
 	ignoreFlat bool
 
-	mu        sync.Mutex
+	mu sync.Mutex
+	// entries are newest first, as Floppy lists them.
+	entries   []map[string]any
 	scrobbles int
 }
 
@@ -47,13 +47,16 @@ func (f *fakeFloppyHistory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	limit = min(limit, 200)
 	offset, _ := strconv.Atoi(query.Get("offset"))
 
+	f.mu.Lock()
+	entries := append([]map[string]any(nil), f.entries...)
+	f.mu.Unlock()
 	var results []any
 	if query.Get("flat") == "true" && !f.ignoreFlat {
-		for _, entry := range f.entries {
+		for _, entry := range entries {
 			results = append(results, entry)
 		}
 	} else {
-		results = floppyHistoryDays(f.entries)
+		results = floppyHistoryDays(entries)
 	}
 	total := len(results)
 	page := results[min(offset, total):min(offset+limit, total)]
@@ -67,6 +70,12 @@ func (f *fakeFloppyHistory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"pagination": map[string]any{"total": total, "limit": limit, "offset": offset, "next": next},
 		"results":    append([]any{}, page...),
 	})
+}
+
+func (f *fakeFloppyHistory) remove(index int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries = append(f.entries[:index:index], f.entries[index+1:]...)
 }
 
 func (f *fakeFloppyHistory) scrobbleCount() int {
@@ -275,5 +284,41 @@ func TestListWatchedImportsEverythingAgainAfterACursorFromAnEarlierRelease(t *te
 	items, complete, _ = listAllWatched(t, server, upstream.URL, cursor)
 	if len(items) != 1 || complete {
 		t.Fatalf("after a current cursor: %d items, complete snapshot %t", len(items), complete)
+	}
+}
+
+func TestListWatchedStartsOverWhenAReadEntryIsDeleted(t *testing.T) {
+	t.Parallel()
+	day := time.Date(2020, time.October, 10, 23, 0, 0, 0, time.UTC)
+	floppy := &fakeFloppyHistory{t: t, entries: busyDayHistory(day)}
+	upstream := httptest.NewServer(floppy)
+	defer upstream.Close()
+	server := NewServer(upstream.Client())
+	page := func(pageToken string) *pluginv1.WatchSyncListRemoteStateResponse {
+		t.Helper()
+		response, err := server.ListRemoteState(context.Background(), &pluginv1.WatchSyncListRemoteStateRequest{
+			Context: authenticatedContext(upstream.URL), PageSize: 20, PageToken: pageToken,
+			StateKinds: []pluginv1.WatchSyncRemoteStateKind{pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_WATCHED},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return response
+	}
+
+	first := page("")
+	if first.GetFault() != nil || len(first.GetItems()) != 20 || first.GetNextPageToken() == "" {
+		t.Fatalf("first page = %#v", first)
+	}
+	// Deleting a play the first page read moves every later entry up a place.
+	floppy.remove(0)
+	second := page(first.GetNextPageToken())
+	if second.GetFault().GetCode() != pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_TEMPORARY || len(second.GetItems()) != 0 {
+		t.Fatalf("second page = %#v", second)
+	}
+	// The next sync starts over and reads every remaining play.
+	items, _, _ := listAllWatched(t, server, upstream.URL, "")
+	if len(items) != 44 {
+		t.Fatalf("items after starting over = %d, want 44", len(items))
 	}
 }
