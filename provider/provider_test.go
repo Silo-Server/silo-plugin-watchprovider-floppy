@@ -254,7 +254,7 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.GetNextPageToken() != "" || second.GetNextCursor() != playedAt.Add(-providerCursorOverlap).Format(time.RFC3339Nano) || !second.GetCompleteSnapshot() {
+	if second.GetNextPageToken() != "" || second.GetNextCursor() != watchedCursorPrefix+playedAt.Add(-providerCursorOverlap).Format(time.RFC3339Nano) || !second.GetCompleteSnapshot() {
 		t.Fatalf("second = %#v", second)
 	}
 	mu.Lock()

@@ -19,10 +19,15 @@ const (
 	// Floppy also tracks music, podcasts, games, and books. Floppy v26.8.6
 	// and later read "tv" as episode plays.
 	historyMediaTypes = "movie,tv"
+	// watchedCursorPrefix marks a watched cursor written since the plugin read
+	// Floppy's flat history. Releases up to 0.3.0 skipped episode plays and a
+	// day's entries past the 30th, so a cursor without the prefix counts as
+	// none, and the next sync imports the whole history again.
+	watchedCursorPrefix = "flat:"
 )
 
 func (s *Server) listWatched(ctx context.Context, client *apiClient, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {
-	cursor, fault := parseCursor(req.GetCursor())
+	cursor, fault := parseWatchedCursor(req.GetCursor())
 	if fault != nil {
 		return &pluginv1.WatchSyncListRemoteStateResponse{Fault: fault}, nil
 	}
@@ -82,9 +87,17 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 		token.Offset = nextOffset
 		response.NextPageToken = encodePageToken(token)
 	} else if nextCursor := providerNextCursor(cursor, token.HighWater); nextCursor != "" {
-		response.NextCursor = nextCursor
+		response.NextCursor = watchedCursorPrefix + nextCursor
 	}
 	return response, nil
+}
+
+func parseWatchedCursor(value string) (time.Time, *pluginv1.WatchSyncFault) {
+	cursor, ok := strings.CutPrefix(value, watchedCursorPrefix)
+	if !ok {
+		return time.Time{}, nil
+	}
+	return parseCursor(cursor)
 }
 
 func (s *Server) listProgress(ctx context.Context, client *apiClient, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {

@@ -144,13 +144,15 @@ func busyDayHistory(day time.Time) []map[string]any {
 	return entries
 }
 
-func listAllWatched(t *testing.T, server *Server, baseURL string) []*pluginv1.WatchSyncRemoteState {
+// listAllWatched walks one watched traversal from cursor and returns its
+// items, whether it was a complete snapshot, and the cursor it ended on.
+func listAllWatched(t *testing.T, server *Server, baseURL, cursor string) ([]*pluginv1.WatchSyncRemoteState, bool, string) {
 	t.Helper()
 	var items []*pluginv1.WatchSyncRemoteState
 	pageToken := ""
 	for range 100 {
 		response, err := server.ListRemoteState(context.Background(), &pluginv1.WatchSyncListRemoteStateRequest{
-			Context: authenticatedContext(baseURL), PageSize: 20, PageToken: pageToken,
+			Context: authenticatedContext(baseURL), Cursor: cursor, PageSize: 20, PageToken: pageToken,
 			StateKinds: []pluginv1.WatchSyncRemoteStateKind{pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_WATCHED},
 		})
 		if err != nil {
@@ -161,11 +163,11 @@ func listAllWatched(t *testing.T, server *Server, baseURL string) []*pluginv1.Wa
 		}
 		items = append(items, response.GetItems()...)
 		if pageToken = response.GetNextPageToken(); pageToken == "" {
-			return items
+			return items, response.GetCompleteSnapshot(), response.GetNextCursor()
 		}
 	}
 	t.Fatal("history traversal did not finish")
-	return nil
+	return nil, false, ""
 }
 
 func TestListWatchedImportsEveryEntryOfABusyDay(t *testing.T) {
@@ -175,7 +177,7 @@ func TestListWatchedImportsEveryEntryOfABusyDay(t *testing.T) {
 	upstream := httptest.NewServer(floppy)
 	defer upstream.Close()
 
-	items := listAllWatched(t, NewServer(upstream.Client()), upstream.URL)
+	items, _, _ := listAllWatched(t, NewServer(upstream.Client()), upstream.URL, "")
 	movies, episodes := 0, map[string]bool{}
 	for _, item := range items {
 		media := item.GetMedia()
@@ -205,7 +207,7 @@ func TestListWatchedReadsDayGroupsFromFloppyWithoutFlatHistory(t *testing.T) {
 	upstream := httptest.NewServer(floppy)
 	defer upstream.Close()
 
-	items := listAllWatched(t, NewServer(upstream.Client()), upstream.URL)
+	items, _, _ := listAllWatched(t, NewServer(upstream.Client()), upstream.URL, "")
 	var keys []string
 	for _, item := range items {
 		keys = append(keys, item.GetMedia().GetMediaItemId())
@@ -252,5 +254,26 @@ func TestApplyWatchedEpisodeFindsEarlierPlayOnABusyDay(t *testing.T) {
 	}
 	if floppy.scrobbleCount() != 0 {
 		t.Fatalf("scrobbles = %d, want 0", floppy.scrobbleCount())
+	}
+}
+
+func TestListWatchedImportsEverythingAgainAfterACursorFromAnEarlierRelease(t *testing.T) {
+	t.Parallel()
+	day := time.Date(2020, time.October, 10, 23, 0, 0, 0, time.UTC)
+	floppy := &fakeFloppyHistory{t: t, entries: busyDayHistory(day)}
+	upstream := httptest.NewServer(floppy)
+	defer upstream.Close()
+	server := NewServer(upstream.Client())
+	wantCursor := watchedCursorPrefix + day.Add(-providerCursorOverlap).Format(time.RFC3339Nano)
+
+	// Releases up to 0.3.0 saved a bare timestamp past the episodes they skipped.
+	items, complete, cursor := listAllWatched(t, server, upstream.URL, day.Format(time.RFC3339Nano))
+	if len(items) != 45 || !complete || cursor != wantCursor {
+		t.Fatalf("after a legacy cursor: %d items, complete snapshot %t, cursor %q", len(items), complete, cursor)
+	}
+	// Only the newest play, inside the cursor's overlap, comes back.
+	items, complete, _ = listAllWatched(t, server, upstream.URL, cursor)
+	if len(items) != 1 || complete {
+		t.Fatalf("after a current cursor: %d items, complete snapshot %t", len(items), complete)
 	}
 }

@@ -57,6 +57,8 @@ The plugin requires a Floppy release that provides:
 
 A Floppy release before v26.8.20 ignores `flat` and groups history by day, listing at most 30 entries a day. The plugin still reads that shape, but it misses the rest of a busier day, both when importing history and when checking whether a completed watch was already sent.
 
+Plugin releases up to 0.3.0 skipped episode plays and a day's entries past the 30th. The first sync after upgrading from one of them reads the whole Floppy history again to import what they skipped. Plays Silo already has are not imported twice.
+
 ## Development
 
 The plugin builds against the `silo-plugin-sdk` rating contract (v0.17.0).
