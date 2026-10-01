@@ -260,7 +260,7 @@ func TestListWatchedUsesStableTraversalAndReturnsIncrementalCursor(t *testing.T)
 	mu.Lock()
 	gotQueries := append([]url.Values(nil), queries...)
 	mu.Unlock()
-	if len(gotQueries) != 2 || gotQueries[0].Get("flat") != "true" || gotQueries[0].Get("end_date") != "" || gotQueries[1].Get("end_date") != "2026-08-06" || gotQueries[1].Get("offset") != "1" {
+	if len(gotQueries) != 2 || gotQueries[0].Get("flat") != "true" || gotQueries[0].Get("media_type") != "movie,tv" || gotQueries[0].Get("end_date") != "" || gotQueries[1].Get("end_date") != "2026-08-06" || gotQueries[1].Get("offset") != "1" {
 		t.Fatalf("queries = %#v", gotQueries)
 	}
 }

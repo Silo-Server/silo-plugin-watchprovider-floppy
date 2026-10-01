@@ -13,7 +13,13 @@ import (
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 )
 
-const providerCursorOverlap = 2 * time.Second
+const (
+	providerCursorOverlap = 2 * time.Second
+	// historyMediaTypes limits history reads to the plays this plugin syncs;
+	// Floppy also tracks music, podcasts, games, and books. Floppy v26.8.6
+	// and later read "tv" as episode plays.
+	historyMediaTypes = "movie,tv"
+)
 
 func (s *Server) listWatched(ctx context.Context, client *apiClient, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {
 	cursor, fault := parseCursor(req.GetCursor())
@@ -27,6 +33,7 @@ func (s *Server) listWatched(ctx context.Context, client *apiClient, req *plugin
 	limit := pageSize(req.GetPageSize())
 	query := url.Values{
 		"flat":          {"true"},
+		"media_type":    {historyMediaTypes},
 		"limit":         {strconv.Itoa(limit)},
 		"offset":        {strconv.Itoa(token.Offset)},
 		"logging_style": {"sessions"},
@@ -337,6 +344,7 @@ func historyContainsEvent(ctx context.Context, client *apiClient, event *pluginv
 	occurredAt := event.GetOccurredAt().AsTime()
 	query := url.Values{
 		"flat":          {"true"},
+		"media_type":    {historyMediaTypes},
 		"start_date":    {occurredAt.Add(-24 * time.Hour).Format(time.DateOnly)},
 		"end_date":      {occurredAt.Add(24 * time.Hour).Format(time.DateOnly)},
 		"logging_style": {"sessions"},

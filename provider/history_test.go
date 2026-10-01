@@ -150,7 +150,7 @@ func listAllWatched(t *testing.T, server *Server, baseURL string) []*pluginv1.Wa
 	pageToken := ""
 	for range 100 {
 		response, err := server.ListRemoteState(context.Background(), &pluginv1.WatchSyncListRemoteStateRequest{
-			Context: authenticatedContext(baseURL), PageSize: 100, PageToken: pageToken,
+			Context: authenticatedContext(baseURL), PageSize: 20, PageToken: pageToken,
 			StateKinds: []pluginv1.WatchSyncRemoteStateKind{pluginv1.WatchSyncRemoteStateKind_WATCH_SYNC_REMOTE_STATE_KIND_WATCHED},
 		})
 		if err != nil {
