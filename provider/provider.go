@@ -203,7 +203,7 @@ func payloadFromEvent(event *pluginv1.WatchSyncEvent) (scrobblePayload, bool, *p
 		return scrobblePayload{}, false, invalidRequestFault("Watch event media is required")
 	}
 	payload := scrobblePayload{
-		IDs:         mergedExternalIDs(media),
+		IDs:         scrobbleIDs(media),
 		Title:       media.GetTitle(),
 		SeriesTitle: media.GetSeriesTitle(),
 	}
@@ -492,6 +492,25 @@ func mergedExternalIDs(media *pluginv1.WatchSyncMedia) map[string]string {
 		}
 	}
 	return output
+}
+
+// scrobbleIDs returns the IDs a scrobble names its title by. Floppy looks a
+// show up by its TVDB ID, then its IMDb ID, then its TMDB ID, and takes an
+// episode match for any of them as the show and episode played. A series'
+// TVDB ID can equal another show's TVDB episode ID, which files the play under
+// that show and episode, so an episode names its series by one ID: TMDB, which
+// Floppy uses as the show directly, or else IMDb, where series and episode IDs
+// never collide.
+func scrobbleIDs(media *pluginv1.WatchSyncMedia) map[string]string {
+	if media.GetMediaType() == pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE {
+		seriesIDs := filteredExternalIDs(media.GetSeriesExternalIds())
+		for _, namespace := range []string{"tmdb", "imdb", "tvdb"} {
+			if id := seriesIDs[namespace]; id != "" {
+				return map[string]string{namespace: id}
+			}
+		}
+	}
+	return mergedExternalIDs(media)
 }
 
 func filteredExternalIDs(input map[string]string) map[string]string {
