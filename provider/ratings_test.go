@@ -433,12 +433,12 @@ func TestListRatingsKeepsResolvedTitlesWhenTheDeadlineCutsARead(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	// Requests may run until half a second before the margin; the fixed clock
-	// keeps the time box from ending the page first.
+	// A 2-second deadline keeps a half-second margin, so requests may run for
+	// 1.5 seconds; the fixed clock keeps the time box from ending the page first.
 	server := NewServer(upstream.Client())
 	fixed := time.Date(2026, time.September, 23, 12, 0, 0, 0, time.UTC)
 	server.now = func() time.Time { return fixed }
-	ctx, cancel := context.WithTimeout(context.Background(), syncDeadlineMargin+500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	response, err := server.ListRemoteState(ctx, &pluginv1.WatchSyncListRemoteStateRequest{
 		Context: authenticatedContext(upstream.URL), StateKinds: ratingKinds,
@@ -902,7 +902,10 @@ func TestApplyEventsDefersEventsPastTheTimeBox(t *testing.T) {
 		{name: "budget", writeTakes: time.Minute, wantApplied: 2},
 		// A 30-second deadline leaves 25 seconds: events start at 0s and 20s.
 		{name: "call deadline", deadline: 30 * time.Second, writeTakes: 20 * time.Second, wantApplied: 2},
-		{name: "call deadline already too close", deadline: 3 * time.Second, writeTakes: time.Second},
+		// A 4-second deadline keeps a 1-second margin and leaves 3 seconds:
+		// events start at 0s, 1s, and 2s.
+		{name: "short call deadline", deadline: 4 * time.Second, writeTakes: time.Second, wantApplied: 3},
+		{name: "call deadline already passed", deadline: -time.Second, writeTakes: time.Second},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -930,7 +933,7 @@ func TestApplyEventsDefersEventsPastTheTimeBox(t *testing.T) {
 				return now
 			}
 			ctx := context.Background()
-			if test.deadline > 0 {
+			if test.deadline != 0 {
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithTimeout(ctx, test.deadline)
 				defer cancel()
@@ -977,6 +980,11 @@ func TestSyncTimeBox(t *testing.T) {
 	defer cancelNear()
 	if got := syncTimeBox(near); got > time.Minute-syncDeadlineMargin || got < time.Minute-syncDeadlineMargin-5*time.Second {
 		t.Fatalf("time box with a one-minute deadline = %s", got)
+	}
+	short, cancelShort := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancelShort()
+	if got := syncTimeBox(short); got > 3*time.Second || got < 2*time.Second {
+		t.Fatalf("time box with a 4s deadline = %s, want just under 3s", got)
 	}
 }
 
@@ -1315,9 +1323,15 @@ func TestSyncRequestLimitEndsBeforeTheHostDeadline(t *testing.T) {
 	if got := syncRequestLimit(near); got > 30*time.Second-syncDeadlineMargin || got < 20*time.Second {
 		t.Fatalf("limit with a 30s deadline = %s, want just under 25s", got)
 	}
-	past, cancelPast := context.WithTimeout(context.Background(), time.Second)
+	// A deadline shorter than four margins keeps a quarter of its time.
+	short, cancelShort := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancelShort()
+	if got := syncRequestLimit(short); got > 3*time.Second || got < 2*time.Second {
+		t.Fatalf("limit with a 4s deadline = %s, want just under 3s", got)
+	}
+	past, cancelPast := context.WithTimeout(context.Background(), -time.Second)
 	defer cancelPast()
 	if got := syncRequestLimit(past); got != 0 {
-		t.Fatalf("limit inside the margin = %s, want 0", got)
+		t.Fatalf("limit after the deadline = %s, want 0", got)
 	}
 }

@@ -21,10 +21,14 @@ const (
 	defaultPageSize = 50
 	// ApplyEvents stops starting new events, and a rating snapshot page stops
 	// starting history reads, after this long, or sooner when the call's
-	// deadline, less syncDeadlineMargin, comes first. A cold Floppy write can
+	// deadline, less the deadline margin, comes first. A cold Floppy write can
 	// trigger a slow metadata fetch, and the host must receive the finished
 	// results before its RPC deadline.
-	syncBudget         = 90 * time.Second
+	syncBudget = 90 * time.Second
+	// syncDeadlineMargin is the time kept free before the call's deadline. A
+	// call with less than four margins left keeps a quarter of its time
+	// instead: Silo sends a confirmed Jellyfin-compat stop with a five-second
+	// deadline, and a fixed margin would leave that stop no time to reach Floppy.
 	syncDeadlineMargin = 5 * time.Second
 )
 
@@ -116,19 +120,27 @@ func (s *Server) ApplyEvents(ctx context.Context, req *pluginv1.WatchSyncApplyEv
 func syncTimeBox(ctx context.Context) time.Duration {
 	budget := syncBudget
 	if deadline, ok := ctx.Deadline(); ok {
-		budget = min(budget, time.Until(deadline)-syncDeadlineMargin)
+		budget = min(budget, untilMargin(deadline))
 	}
 	return budget
 }
 
 // syncRequestLimit bounds every request of one call: the client's request
-// timeout, cut to end syncDeadlineMargin before the call's deadline.
+// timeout, cut to end the deadline margin before the call's deadline.
 func syncRequestLimit(ctx context.Context) time.Duration {
 	limit := defaultRequestTimeout
 	if deadline, ok := ctx.Deadline(); ok {
-		limit = min(limit, max(time.Until(deadline)-syncDeadlineMargin, 0))
+		limit = min(limit, max(untilMargin(deadline), 0))
 	}
 	return limit
+}
+
+// untilMargin returns the time left before deadline, less the margin kept for
+// returning results: syncDeadlineMargin, or a quarter of the time left when
+// that is shorter. It is negative once the deadline has passed.
+func untilMargin(deadline time.Time) time.Duration {
+	remaining := time.Until(deadline)
+	return remaining - min(syncDeadlineMargin, remaining/4)
 }
 
 func (s *Server) ListRemoteState(ctx context.Context, req *pluginv1.WatchSyncListRemoteStateRequest) (*pluginv1.WatchSyncListRemoteStateResponse, error) {

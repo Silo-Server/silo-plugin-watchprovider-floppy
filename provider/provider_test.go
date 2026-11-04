@@ -428,6 +428,69 @@ func TestApplyRateLimitIsConnectionWide(t *testing.T) {
 	}
 }
 
+// Silo delivers a Jellyfin-compat client's Stopped report as a confirmed stop
+// under a five-second deadline, and spends part of it before the call reaches
+// the plugin. The stop must still reach Floppy, not be deferred untried on
+// every retry.
+func TestApplyEventsSendsAStopUnderAShortHostDeadline(t *testing.T) {
+	t.Parallel()
+	for _, deadline := range []time.Duration{4500 * time.Millisecond, 2 * time.Second} {
+		t.Run(deadline.String(), func(t *testing.T) {
+			t.Parallel()
+			var mu sync.Mutex
+			var stops []scrobblePayload
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/api/v1/scrobble/" {
+					t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+				var payload scrobblePayload
+				if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+					t.Errorf("decode payload: %v", err)
+				}
+				mu.Lock()
+				stops = append(stops, payload)
+				mu.Unlock()
+				writeJSON(t, w, map[string]any{"status": "ok"})
+			}))
+			defer upstream.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), deadline)
+			defer cancel()
+			response, err := NewServer(upstream.Client()).ApplyEvents(ctx, &pluginv1.WatchSyncApplyEventsRequest{
+				Context: authenticatedContext(upstream.URL),
+				Events: []*pluginv1.WatchSyncEvent{{
+					EventId:         "stop-1",
+					Operation:       pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP,
+					PositionSeconds: 780,
+					DurationSeconds: 3400,
+					Media: &pluginv1.WatchSyncMedia{
+						MediaType:         pluginv1.WatchSyncMediaType_WATCH_SYNC_MEDIA_TYPE_EPISODE,
+						SeriesExternalIds: map[string]string{"tmdb": "1399"},
+						SeasonNumber:      1,
+						EpisodeNumber:     2,
+					},
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			results := response.GetResults()
+			if response.GetFault() != nil || len(results) != 1 ||
+				results[0].GetStatus() != pluginv1.WatchSyncApplyStatus_WATCH_SYNC_APPLY_STATUS_APPLIED {
+				t.Fatalf("results = %v, fault = %v, Floppy requests = %d; want the stop applied",
+					results, response.GetFault(), len(stops))
+			}
+			if len(stops) != 1 || stops[0].Action != "stop" || stops[0].Completed == nil || *stops[0].Completed {
+				t.Fatalf("Floppy received %#v, want one incomplete stop", stops)
+			}
+		})
+	}
+}
+
 func providerConfig(baseURL string) *pluginv1.WatchSyncProviderConfig {
 	return &pluginv1.WatchSyncProviderConfig{Values: map[string]string{configBaseURL: baseURL}}
 }
